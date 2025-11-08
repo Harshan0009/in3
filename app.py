@@ -1,12 +1,9 @@
-
 import streamlit as st
 import sqlite3
 import pandas as pd
 from datetime import datetime, date
 from io import BytesIO
-
-# Password hashing (pure Python)
-import hashlib
+import os, hashlib
 
 # Optional PDF libs
 try:
@@ -22,171 +19,30 @@ except Exception:
 DB_PATH = "inventory.db"
 
 # ----------------------------
-# DB Helpers & Auth
+# Password hashing (no passlib)
+# ----------------------------
+def _hash_password(password: str) -> str:
+    """Return 'salt$hexdigest' using SHA-256 with a random salt."""
+    salt = os.urandom(16).hex()
+    digest = hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+    return f"{salt}${digest}"
+
+def _verify_password(password: str, stored: str) -> bool:
+    try:
+        salt, hexd = stored.split("$", 1)
+    except ValueError:
+        return False
+    digest = hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+    return digest == hexd
+
+# ----------------------------
+# DB Helpers
 # ----------------------------
 def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA foreign_keys = ON;")
     return conn
 
-def column_exists(conn, table, column):
-    cur = conn.execute(f"PRAGMA table_info({table})")
-    return any(r[1] == column for r in cur.fetchall())
-
-def init_db():
-    """Create base tables and apply idempotent migrations safely."""
-    conn = get_conn()
-    cur = conn.cursor()
-
-    # Users (for login)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS users(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );""")
-
-    # Create default admin user if not exists
-    cur = conn.execute("SELECT COUNT(*) FROM users")
-    if (cur.fetchone()[0] or 0) == 0:
-        import hashlib
-        default_password = hashlib.sha256("admin123".encode()).hexdigest()
-        conn.execute(
-            "INSERT INTO users(username, password_hash) VALUES(?,?)",
-            ("admin", default_password)
-        )
-
-    conn.commit()
-    conn.close()
-
-
-    # App settings (invoice/company)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS settings(
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        company_name TEXT,
-        company_address TEXT,
-        company_phone TEXT,
-        company_email TEXT,
-        company_gstin TEXT,
-        invoice_footer TEXT,
-        logo BLOB,
-        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );""")
-    cur.execute("INSERT OR IGNORE INTO settings(id, company_name, company_address) VALUES(1, 'Your Company', 'Street, City, State, Pincode')")
-
-    # Products
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS products(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL UNIQUE,
-        category TEXT,
-        unit TEXT DEFAULT 'pcs',
-        selling_price REAL DEFAULT 0.0,
-        tax_rate REAL DEFAULT 0.0,
-        barcode TEXT,
-        low_stock_threshold REAL DEFAULT 0,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );""")
-    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode) WHERE barcode IS NOT NULL")
-
-    # Purchases
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS purchases(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-        qty REAL NOT NULL,
-        cost_price REAL DEFAULT 0.0,
-        bill_no TEXT,
-        supplier TEXT,
-        purchased_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        notes TEXT
-    );""")
-
-    # Customers (rich details)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS customers(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL UNIQUE,
-        phone TEXT,
-        email TEXT,
-        gstin TEXT,
-        pan TEXT,
-        address TEXT,
-        city TEXT,
-        state TEXT,
-        pincode TEXT,
-        credit_limit REAL DEFAULT 0,
-        opening_balance REAL DEFAULT 0,
-        notes TEXT,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );""")
-
-    # Ledger (A/R)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS ledger(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
-        entry_type TEXT NOT NULL, -- 'sale', 'payment', 'adjustment'
-        ref_id INTEGER,           -- sale_master id if entry_type='sale'
-        amount REAL NOT NULL,     -- debit positive (sale), credit negative (payment)
-        entry_date TEXT DEFAULT CURRENT_TIMESTAMP,
-        note TEXT
-    );""")
-
-    # Multi-item sales
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS sale_master(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        invoice_no TEXT UNIQUE,
-        customer_id INTEGER REFERENCES customers(id),
-        sold_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        subtotal REAL DEFAULT 0,
-        tax_amount REAL DEFAULT 0,
-        total_amount REAL DEFAULT 0,
-        notes TEXT
-    );""")
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS sale_items(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        sale_id INTEGER NOT NULL REFERENCES sale_master(id) ON DELETE CASCADE,
-        product_id INTEGER NOT NULL REFERENCES products(id),
-        description TEXT,
-        qty REAL NOT NULL,
-        unit_price REAL NOT NULL,
-        gst_rate REAL DEFAULT 0,
-        line_tax REAL DEFAULT 0,
-        line_total REAL DEFAULT 0
-    );""")
-
-    # Default admin user
-    cur = conn.execute("SELECT COUNT(*) FROM users")
-    if (cur.fetchone()[0] or 0) == 0:
-        conn.execute("INSERT INTO users(username, password_hash) VALUES(?,?)", ("admin", bcrypt.hash("admin123")))
-
-    conn.commit()
-    conn.close()
-
-def verify_login(username, password):
-    import hashlib
-    with get_conn() as conn:
-        row = conn.execute("SELECT id, password_hash FROM users WHERE username=?", (username,)).fetchone()
-    if not row:
-        return None
-    uid, stored_hash = row
-    hashed = hashlib.sha256(password.encode()).hexdigest()
-    return int(uid) if hashed == stored_hash else None
-
-def change_password(user_id, new_password):
-    hashed = hashlib.sha256(new_password.encode()).hexdigest()
-    with get_conn() as conn:
-        conn.execute("UPDATE users SET password_hash=? WHERE id=?", (hashed, user_id))
-        conn.commit()
-
-# ----------------------------
-# Loaders/Utils
-# ----------------------------
 @st.cache_data(ttl=60)
 def load_products():
     with get_conn() as conn:
@@ -199,25 +55,181 @@ def load_customers():
 
 def load_settings():
     with get_conn() as conn:
-        row = conn.execute("""SELECT company_name, company_address, company_phone, company_email, company_gstin, invoice_footer, logo
-                              FROM settings WHERE id=1""").fetchone()
+        row = conn.execute("""
+            SELECT company_name, company_address, company_phone, company_email,
+                   company_gstin, invoice_footer, logo
+            FROM settings WHERE id=1
+        """).fetchone()
     keys = ["company_name","company_address","company_phone","company_email","company_gstin","invoice_footer","logo"]
     if row:
         return dict(zip(keys, row))
-    return {k: (None if k=="logo" else "") for k in keys}
+    return {k: (None if k == "logo" else "") for k in keys}
 
-def save_settings(data):
+def save_settings(data: dict):
     with get_conn() as conn:
-        conn.execute("""UPDATE settings SET company_name=?, company_address=?, company_phone=?, company_email=?, company_gstin=?, invoice_footer=?, logo=?, updated_at=CURRENT_TIMESTAMP
-                        WHERE id=1""",
-                     (data.get("company_name"), data.get("company_address"), data.get("company_phone"),
-                      data.get("company_email"), data.get("company_gstin"), data.get("invoice_footer"),
-                      data.get("logo")))
+        conn.execute("""
+            UPDATE settings SET company_name=?, company_address=?, company_phone=?,
+                                company_email=?, company_gstin=?, invoice_footer=?, logo=?,
+                                updated_at=CURRENT_TIMESTAMP
+            WHERE id=1
+        """, (
+            data.get("company_name"), data.get("company_address"), data.get("company_phone"),
+            data.get("company_email"), data.get("company_gstin"), data.get("invoice_footer"),
+            data.get("logo"),
+        ))
         conn.commit()
 
+def init_db():
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # Users
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+
+    # Settings (drop CHECK for wider SQLite compatibility)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS settings(
+            id INTEGER PRIMARY KEY,
+            company_name TEXT,
+            company_address TEXT,
+            company_phone TEXT,
+            company_email TEXT,
+            company_gstin TEXT,
+            invoice_footer TEXT,
+            logo BLOB,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    cur.execute("INSERT OR IGNORE INTO settings(id, company_name, company_address) VALUES(1,'Your Company','Street, City, State, Pincode')")
+
+    # Products
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS products(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            category TEXT,
+            unit TEXT DEFAULT 'pcs',
+            selling_price REAL DEFAULT 0.0,
+            tax_rate REAL DEFAULT 0.0,
+            barcode TEXT,
+            low_stock_threshold REAL DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode) WHERE barcode IS NOT NULL")
+
+    # Purchases
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS purchases(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+            qty REAL NOT NULL,
+            cost_price REAL DEFAULT 0.0,
+            bill_no TEXT,
+            supplier TEXT,
+            purchased_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            notes TEXT
+        );
+    """)
+
+    # Customers
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS customers(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            phone TEXT,
+            email TEXT,
+            gstin TEXT,
+            pan TEXT,
+            address TEXT,
+            city TEXT,
+            state TEXT,
+            pincode TEXT,
+            credit_limit REAL DEFAULT 0,
+            opening_balance REAL DEFAULT 0,
+            notes TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+
+    # Ledger (A/R)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ledger(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+            entry_type TEXT NOT NULL, -- sale, payment, adjustment
+            ref_id INTEGER,           -- sale_master id if sale
+            amount REAL NOT NULL,     -- +debit(sale), -credit(payment)
+            entry_date TEXT DEFAULT CURRENT_TIMESTAMP,
+            note TEXT
+        );
+    """)
+
+    # Multi-item sales
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS sale_master(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            invoice_no TEXT UNIQUE,
+            customer_id INTEGER REFERENCES customers(id),
+            sold_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            subtotal REAL DEFAULT 0,
+            tax_amount REAL DEFAULT 0,
+            total_amount REAL DEFAULT 0,
+            notes TEXT
+        );
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS sale_items(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sale_id INTEGER NOT NULL REFERENCES sale_master(id) ON DELETE CASCADE,
+            product_id INTEGER NOT NULL REFERENCES products(id),
+            description TEXT,
+            qty REAL NOT NULL,
+            unit_price REAL NOT NULL,
+            gst_rate REAL DEFAULT 0,
+            line_tax REAL DEFAULT 0,
+            line_total REAL DEFAULT 0
+        );
+    """)
+
+    # Default admin (admin / admin123)
+    cur = conn.execute("SELECT COUNT(*) FROM users")
+    if (cur.fetchone()[0] or 0) == 0:
+        conn.execute("INSERT INTO users(username, password_hash) VALUES(?,?)",
+                     ("admin", _hash_password("admin123")))
+
+    conn.commit()
+    conn.close()
+
+# ----------------------------
+# Auth
+# ----------------------------
+def verify_login(username: str, password: str) -> int | None:
+    with get_conn() as conn:
+        row = conn.execute("SELECT id, password_hash FROM users WHERE username=?", (username,)).fetchone()
+    if not row:
+        return None
+    uid, stored_hash = row
+    return int(uid) if _verify_password(password, stored_hash) else None
+
+def change_password(user_id: int, new_password: str):
+    with get_conn() as conn:
+        conn.execute("UPDATE users SET password_hash=? WHERE id=?", (_hash_password(new_password), user_id))
+        conn.commit()
+
+# ----------------------------
+# Business helpers
+# ----------------------------
 def get_or_create_customer(name, **fields):
     name = (name or "").strip()
-    if not name: 
+    if not name:
         return None
     with get_conn() as conn:
         cur = conn.execute("SELECT id FROM customers WHERE name=?", (name,)).fetchone()
@@ -230,7 +242,7 @@ def get_or_create_customer(name, **fields):
         cur = conn.execute("SELECT id FROM customers WHERE name=?", (name,)).fetchone()
         return int(cur[0])
 
-def get_customer_balance(customer_id, as_of=None):
+def get_customer_balance(customer_id: int, as_of: str | None = None) -> float:
     with get_conn() as conn:
         ob_row = conn.execute("SELECT COALESCE(opening_balance,0) FROM customers WHERE id=?", (customer_id,)).fetchone()
         ob = float(ob_row[0]) if ob_row else 0.0
@@ -242,7 +254,7 @@ def get_customer_balance(customer_id, as_of=None):
                               (customer_id,)).fetchone()[0]
         return round(ob + float(lg or 0), 2)
 
-def get_stock(product_id):
+def get_stock(product_id: int) -> float:
     with get_conn() as conn:
         p = conn.execute("SELECT COALESCE(SUM(qty),0) FROM purchases WHERE product_id=?", (product_id,)).fetchone()[0]
         s = conn.execute("SELECT COALESCE(SUM(qty),0) FROM sale_items WHERE product_id=?", (product_id,)).fetchone()[0]
@@ -289,14 +301,14 @@ def add_purchase(product_id, qty, cp, bill_no, supplier, when, notes):
 
 def next_invoice_no():
     with get_conn() as conn:
-        cur = conn.execute("SELECT COUNT(*) FROM sale_master").fetchone()[0]
+        n = conn.execute("SELECT COUNT(*) FROM sale_master").fetchone()[0]
     now = datetime.now().strftime("%Y%m")
-    return f"INV-{now}-{int(cur)+1:04d}"
+    return f"INV-{now}-{int(n)+1:04d}"
 
 def add_sale_multi(customer_id, sold_at, items, invoice_no, notes, payment_received):
     with get_conn() as conn:
-        # compute and validate
         subtotal = 0.0; tax_total = 0.0; total_amount = 0.0
+        # calculate/validate
         for it in items:
             qty = float(it["qty"]); price = float(it["unit_price"]); gst = float(it["gst_rate"])
             if qty <= 0: raise ValueError("Quantity must be > 0")
@@ -308,13 +320,13 @@ def add_sale_multi(customer_id, sold_at, items, invoice_no, notes, payment_recei
             line_total = round(line_sub + line_tax, 2)
             subtotal += line_sub; tax_total += line_tax; total_amount += line_total
 
-        # header
+        # master
         conn.execute("""INSERT INTO sale_master(invoice_no, customer_id, sold_at, subtotal, tax_amount, total_amount, notes)
                         VALUES(?,?,?,?,?,?,?)""",
                      (invoice_no, customer_id, sold_at, round(subtotal,2), round(tax_total,2), round(total_amount,2), notes))
         sale_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
-        # lines
+        # items
         for it in items:
             qty = float(it["qty"]); price = float(it["unit_price"]); gst = float(it["gst_rate"])
             line_sub = qty * price
@@ -325,7 +337,7 @@ def add_sale_multi(customer_id, sold_at, items, invoice_no, notes, payment_recei
                             VALUES(?,?,?,?,?,?,?,?)""",
                          (sale_id, int(it["product_id"]), desc, qty, price, gst, line_tax, line_total))
 
-        # ledger
+        # ledger entries
         conn.execute("""INSERT INTO ledger(customer_id, entry_type, ref_id, amount, entry_date, note)
                         VALUES(?,?,?,?,?,?)""",
                      (customer_id, "sale", sale_id, round(total_amount,2), sold_at, f"Invoice {invoice_no}"))
@@ -334,6 +346,7 @@ def add_sale_multi(customer_id, sold_at, items, invoice_no, notes, payment_recei
             conn.execute("""INSERT INTO ledger(customer_id, entry_type, ref_id, amount, entry_date, note)
                             VALUES(?,?,?,?,?,?)""",
                          (customer_id, "payment", sale_id, amt, sold_at, f"Against {invoice_no}"))
+
         conn.commit()
         return int(sale_id), round(subtotal,2), round(tax_total,2), round(total_amount,2)
 
@@ -387,7 +400,7 @@ def reset_cache():
     load_customers.clear()
 
 # ----------------------------
-# PDF Builders
+# PDF builders
 # ----------------------------
 def make_invoice_pdf_multi(sale_row, items_df, settings):
     if not REPORTLAB_OK:
@@ -397,7 +410,7 @@ def make_invoice_pdf_multi(sale_row, items_df, settings):
     W, H = A4
     x = 20*mm; y = H - 20*mm
 
-    # Logo if present
+    # Header with optional logo
     logo_bytes = settings.get("logo")
     x_text = x
     if logo_bytes:
@@ -419,7 +432,6 @@ def make_invoice_pdf_multi(sale_row, items_df, settings):
     c.drawString(x, y, f"Date: {str(sale_row.get('sold_at',''))[:10]}"); y -= 12
     c.drawString(x, y, f"Bill To: {sale_row.get('customer','Walk-in')}"); y -= 16
 
-    # Table header
     c.setFont("Helvetica-Bold", 10)
     c.drawString(x, y, "Item")
     c.drawRightString(W-130, y, "Qty")
@@ -430,7 +442,7 @@ def make_invoice_pdf_multi(sale_row, items_df, settings):
 
     c.setFont("Helvetica", 10)
     for _, r in items_df.iterrows():
-        if y < 60*mm:  # new page
+        if y < 60*mm:
             c.showPage(); y = H - 20*mm
             c.setFont("Helvetica-Bold", 10)
             c.drawString(x, y, "Item"); c.drawRightString(W-130, y, "Qty"); c.drawRightString(W-100, y, "Rate"); c.drawRightString(W-70, y, "GST%"); c.drawRightString(W-30, y, "Amount")
@@ -439,7 +451,7 @@ def make_invoice_pdf_multi(sale_row, items_df, settings):
         c.drawRightString(W-130, y, f"{float(r.get('qty',0)):.2f}")
         c.drawRightString(W-100, y, f"{float(r.get('unit_price',0)):.2f}")
         c.drawRightString(W-70, y, f"{float(r.get('gst_rate',0)):.0f}")
-        amount = float(r.get("qty",0))*float(r.get("unit_price",0))
+        amount = float(r.get("qty",0)) * float(r.get("unit_price",0))
         c.drawRightString(W-30, y, f"{amount:.2f}")
         y -= 14
 
@@ -464,7 +476,6 @@ def customer_statement_pdf(customer_row, ledger_df, opening_balance, settings, d
     W, H = A4
     x = 20*mm; y = H - 20*mm
 
-    # Header with logo
     logo_bytes = settings.get("logo")
     x_text = x
     if logo_bytes:
@@ -485,7 +496,6 @@ def customer_statement_pdf(customer_row, ledger_df, opening_balance, settings, d
     c.drawString(x, y, f"Period: {dfrom} to {dto}"); y -= 12
     c.drawString(x, y, f"Opening Balance: ₹ {opening_balance:.2f}"); y -= 14
 
-    # Table header
     c.setFont("Helvetica-Bold", 10)
     c.drawString(x, y, "Date")
     c.drawString(x+80, y, "Type")
@@ -519,24 +529,8 @@ def customer_statement_pdf(customer_row, ledger_df, opening_balance, settings, d
     c.showPage(); c.save(); buf.seek(0)
     return buf.getvalue()
 
-def export_reports_excel(dfp, sales_master, sales_items, stock, balances):
-    out = BytesIO()
-    with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
-        if dfp is not None and not dfp.empty:
-            dfp.to_excel(writer, index=False, sheet_name="Purchases")
-        if sales_master is not None and not sales_master.empty:
-            sales_master.to_excel(writer, index=False, sheet_name="SalesMaster")
-        if sales_items is not None and not sales_items.empty:
-            sales_items.to_excel(writer, index=False, sheet_name="SalesItems")
-        if stock is not None and not stock.empty:
-            stock.to_excel(writer, index=False, sheet_name="Stock")
-        if balances is not None and not balances.empty:
-            balances.to_excel(writer, index=False, sheet_name="CustomerBalances")
-    out.seek(0)
-    return out
-
 # ----------------------------
-# LOGIN GATE
+# UI pieces
 # ----------------------------
 def login_gate():
     st.title("🔒 Login")
@@ -553,13 +547,12 @@ def login_gate():
             st.error("Invalid credentials")
 
 # ----------------------------
-# UI
+# Main App
 # ----------------------------
 def main():
     st.set_page_config(page_title="Inventory (Login + Multi-item + PDFs)", page_icon="📦", layout="wide")
     init_db()
 
-    # auth
     if "user_id" not in st.session_state:
         login_gate()
         return
@@ -601,8 +594,7 @@ def main():
             barcode = c5.text_input("Barcode (optional)")
             low_thr = c6.number_input("Low Stock Threshold", min_value=0.0, step=1.0)
             tax_rate = c7.number_input("GST %", min_value=0.0, step=1.0, help="e.g., 0, 5, 12, 18, 28")
-            submitted = st.form_submit_button("Save Product")
-            if submitted:
+            if st.form_submit_button("Save Product"):
                 if not name.strip():
                     st.error("Name is required.")
                 else:
@@ -660,8 +652,12 @@ def main():
                     with get_conn() as conn:
                         cur = conn.execute("SELECT id FROM customers WHERE name=?", (cname.strip(),)).fetchone()
                         if cur:
-                            conn.execute("""UPDATE customers SET phone=?, email=?, gstin=?, pan=?, address=?, city=?, state=?, pincode=?, credit_limit=?, opening_balance=?, notes=? WHERE id=?""",
-                                         (cphone, cemail, gstin, pan, caddr, city, state, pin, credit, cob, notes, int(cur[0])))
+                            conn.execute("""UPDATE customers
+                                            SET phone=?, email=?, gstin=?, pan=?, address=?, city=?, state=?, pincode=?,
+                                                credit_limit=?, opening_balance=?, notes=?
+                                            WHERE id=?""",
+                                         (cphone, cemail, gstin, pan, caddr, city, state, pin,
+                                          credit, cob, notes, int(cur[0])))
                         else:
                             conn.execute("""INSERT INTO customers(name, phone, email, gstin, pan, address, city, state, pincode, credit_limit, opening_balance, notes)
                                             VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
@@ -718,7 +714,7 @@ def main():
 
         # Balance
         last_balance = 0.0
-        if mode == "Select existing" and custs is not None and not custs.empty:
+        if mode == "Select existing" and not custs.empty:
             last_balance = get_customer_balance(int(cust_id))
         st.info(f"Customer last balance: ₹ {last_balance:,.2f} (positive = receivable)")
 
@@ -743,14 +739,14 @@ def main():
                 st.success("Added to cart.")
 
         if st.session_state.cart:
-            cart_rows = []
+            rows = []
             for idx, it in enumerate(st.session_state.cart, start=1):
                 name = prods.set_index("id").loc[it["product_id"], "name"] if not prods.empty else str(it["product_id"])
-                line_sub = it["qty"]*it["unit_price"]
+                line_sub = it["qty"] * it["unit_price"]
                 line_tax = round(line_sub * it["gst_rate"]/100.0, 2)
                 line_total = round(line_sub + line_tax, 2)
-                cart_rows.append([idx, name, it["qty"], it["unit_price"], it["gst_rate"], line_tax, line_total])
-            df_cart = pd.DataFrame(cart_rows, columns=["#","Product","Qty","Unit Price","GST %","Line Tax","Line Total"])
+                rows.append([idx, name, it["qty"], it["unit_price"], it["gst_rate"], line_tax, line_total])
+            df_cart = pd.DataFrame(rows, columns=["#","Product","Qty","Unit Price","GST %","Line Tax","Line Total"])
             st.dataframe(df_cart, use_container_width=True)
             subtotal = (df_cart["Qty"]*df_cart["Unit Price"]).sum()
             tax_total = df_cart["Line Tax"].sum()
@@ -762,7 +758,6 @@ def main():
         else:
             st.info("Cart is empty.")
 
-        # Invoice meta
         inv1, inv2 = st.columns(2)
         invoice_no = inv1.text_input("Invoice No.", value=next_invoice_no())
         sold_on = inv2.date_input("Invoice date", value=date.today())
@@ -813,8 +808,11 @@ def main():
             if st.button("Create PDF Invoice"):
                 row = sm.set_index("id").loc[sel_sale].to_dict()
                 items = list_sales_items(sel_sale)
-                pdf_bytes = make_invoice_pdf_multi(row, items, settings)
-                st.download_button("Download Invoice PDF", data=pdf_bytes, file_name=f"{row.get('invoice_no','invoice')}.pdf", mime="application/pdf")
+                if not REPORTLAB_OK:
+                    st.error("ReportLab not installed. Add 'reportlab' to requirements.")
+                else:
+                    pdf_bytes = make_invoice_pdf_multi(row, items, settings)
+                    st.download_button("Download Invoice PDF", data=pdf_bytes, file_name=f"{row.get('invoice_no','invoice')}.pdf", mime="application/pdf")
 
     # 6) Stock
     with tabs[5]:
@@ -876,8 +874,11 @@ def main():
             settings = load_settings()
             if st.button("Download Statement PDF"):
                 cust_row = custs[custs["id"]==int(cust_for_stmt)].iloc[0].to_dict()
-                pdf = customer_statement_pdf(cust_row, ledger_df, opening, settings, dfrom.isoformat(), dto.isoformat())
-                st.download_button("Save statement.pdf", data=pdf, file_name=f"statement_{cust_row.get('name','customer')}.pdf", mime="application/pdf")
+                if not REPORTLAB_OK:
+                    st.error("ReportLab not installed. Add 'reportlab' to requirements.")
+                else:
+                    pdf = customer_statement_pdf(cust_row, ledger_df, opening, settings, dfrom.isoformat(), dto.isoformat())
+                    st.download_button("Save statement.pdf", data=pdf, file_name=f"statement_{cust_row.get('name','customer')}.pdf", mime="application/pdf")
 
     # 8) Settings
     with tabs[7]:
