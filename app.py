@@ -536,7 +536,12 @@ def main():
         st.markdown("### Generate PDF Invoice")
         if not dfs.empty:
             sale_ids = dfs["id"].tolist()
-            sel_sale = st.selectbox("Select a sale", options=sale_ids, format_func=lambda i: f\"{int(i)} — {dfs.set_index('id').loc[i, 'invoice_no']}\" )
+            sel_sale = st.selectbox(
+    "Select a sale",
+    options=sale_ids,
+    format_func=lambda i: f"{int(i)} — {dfs.set_index('id').loc[i, 'invoice_no']}"
+)
+
             company_name = st.text_input("Company Name", value="Your Company")
             company_address = st.text_area("Address", value="Street, City, State, Pincode")
             company_phone = st.text_input("Phone", value="")
