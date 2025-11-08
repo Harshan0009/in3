@@ -1,11 +1,36 @@
+# app.py
 import streamlit as st
 import sqlite3
 import pandas as pd
 from datetime import datetime, date
 from io import BytesIO
-import os, hashlib
+import hashlib, secrets
 
+# ----------------------------
+# Password hashing (stdlib PBKDF2)
+# ----------------------------
+PBK_ALGO = "sha256"
+PBK_ITERS = 200_000
+PBK_LEN = 32  # 256-bit
+
+def _pbkdf2(password: str, salt_hex: str) -> str:
+    salt = bytes.fromhex(salt_hex)
+    dk = hashlib.pbkdf2_hmac(PBK_ALGO, password.encode("utf-8"), salt, PBK_ITERS, dklen=PBK_LEN)
+    return dk.hex()
+
+def make_password(password: str) -> tuple[str, str]:
+    salt_hex = secrets.token_hex(16)  # 128-bit salt
+    return _pbkdf2(password, salt_hex), salt_hex
+
+def verify_password(password: str, stored_hash: str, salt_hex: str) -> bool:
+    try:
+        return _pbkdf2(password, salt_hex) == stored_hash
+    except Exception:
+        return False
+
+# ----------------------------
 # Optional PDF libs
+# ----------------------------
 try:
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfgen import canvas
@@ -19,23 +44,6 @@ except Exception:
 DB_PATH = "inventory.db"
 
 # ----------------------------
-# Password hashing (no passlib)
-# ----------------------------
-def _hash_password(password: str) -> str:
-    """Return 'salt$hexdigest' using SHA-256 with a random salt."""
-    salt = os.urandom(16).hex()
-    digest = hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
-    return f"{salt}${digest}"
-
-def _verify_password(password: str, stored: str) -> bool:
-    try:
-        salt, hexd = stored.split("$", 1)
-    except ValueError:
-        return False
-    digest = hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
-    return digest == hexd
-
-# ----------------------------
 # DB Helpers
 # ----------------------------
 def get_conn():
@@ -43,6 +51,162 @@ def get_conn():
     conn.execute("PRAGMA foreign_keys = ON;")
     return conn
 
+def column_exists(conn, table, column):
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    return any(r[1] == column for r in cur.fetchall())
+
+def init_db():
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # Users
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        password_salt TEXT NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );""")
+    if not column_exists(conn, "users", "password_salt"):
+        conn.execute("ALTER TABLE users ADD COLUMN password_salt TEXT")
+        conn.execute("DELETE FROM users")
+
+    # Settings
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS settings(
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        company_name TEXT,
+        company_address TEXT,
+        company_phone TEXT,
+        company_email TEXT,
+        company_gstin TEXT,
+        invoice_footer TEXT,
+        logo BLOB,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );""")
+    cur.execute("INSERT OR IGNORE INTO settings(id, company_name, company_address) VALUES(1, 'Your Company', 'Street, City, State, Pincode')")
+
+    # Products
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS products(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        category TEXT,
+        unit TEXT DEFAULT 'pcs',
+        selling_price REAL DEFAULT 0.0,
+        tax_rate REAL DEFAULT 0.0,
+        barcode TEXT,
+        low_stock_threshold REAL DEFAULT 0,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );""")
+    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode) WHERE barcode IS NOT NULL")
+
+    # Purchases
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS purchases(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+        qty REAL NOT NULL,
+        cost_price REAL DEFAULT 0.0,
+        bill_no TEXT,
+        supplier TEXT,
+        purchased_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        notes TEXT
+    );""")
+
+    # Customers
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS customers(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        phone TEXT,
+        email TEXT,
+        gstin TEXT,
+        pan TEXT,
+        address TEXT,
+        city TEXT,
+        state TEXT,
+        pincode TEXT,
+        credit_limit REAL DEFAULT 0,
+        opening_balance REAL DEFAULT 0,
+        notes TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );""")
+
+    # Ledger
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS ledger(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+        entry_type TEXT NOT NULL,
+        ref_id INTEGER,
+        amount REAL NOT NULL,
+        entry_date TEXT DEFAULT CURRENT_TIMESTAMP,
+        note TEXT
+    );""")
+
+    # Sales (master/items)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS sale_master(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        invoice_no TEXT UNIQUE,
+        customer_id INTEGER REFERENCES customers(id),
+        sold_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        subtotal REAL DEFAULT 0,
+        tax_amount REAL DEFAULT 0,
+        total_amount REAL DEFAULT 0,
+        notes TEXT
+    );""")
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS sale_items(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sale_id INTEGER NOT NULL REFERENCES sale_master(id) ON DELETE CASCADE,
+        product_id INTEGER NOT NULL REFERENCES products(id),
+        description TEXT,
+        qty REAL NOT NULL,
+        unit_price REAL NOT NULL,
+        gst_rate REAL DEFAULT 0,
+        line_tax REAL DEFAULT 0,
+        line_total REAL DEFAULT 0
+    );""")
+
+    # Default admin
+    cur = conn.execute("SELECT COUNT(*) FROM users")
+    if (cur.fetchone()[0] or 0) == 0:
+        h, s = make_password("admin123")
+        conn.execute("INSERT INTO users(username, password_hash, password_salt) VALUES(?,?,?)", ("admin", h, s))
+
+    conn.commit()
+    conn.close()
+
+# ----------------------------
+# Auth helpers
+# ----------------------------
+def verify_login(username, password):
+    with get_conn() as conn:
+        row = conn.execute("SELECT id, password_hash, password_salt FROM users WHERE username=?", (username,)).fetchone()
+    if not row:
+        return None
+    uid, stored_hash, salt_hex = row
+    return int(uid) if verify_password(password, stored_hash, salt_hex) else None
+
+def change_password(user_id, new_password):
+    h, s = make_password(new_password)
+    with get_conn() as conn:
+        conn.execute("UPDATE users SET password_hash=?, password_salt=? WHERE id=?", (h, s, user_id))
+        conn.commit()
+
+def reset_admin_password(new_password="admin123"):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM users WHERE username='admin'")
+        h, s = make_password(new_password)
+        conn.execute("INSERT OR REPLACE INTO users(id, username, password_hash, password_salt) VALUES(1, 'admin', ?, ?)", (h, s))
+        conn.commit()
+
+# ----------------------------
+# Loaders/Utils
+# ----------------------------
 @st.cache_data(ttl=60)
 def load_products():
     with get_conn() as conn:
@@ -55,181 +219,24 @@ def load_customers():
 
 def load_settings():
     with get_conn() as conn:
-        row = conn.execute("""
-            SELECT company_name, company_address, company_phone, company_email,
-                   company_gstin, invoice_footer, logo
-            FROM settings WHERE id=1
-        """).fetchone()
+        row = conn.execute("""SELECT company_name, company_address, company_phone, company_email, company_gstin, invoice_footer, logo
+                              FROM settings WHERE id=1""").fetchone()
     keys = ["company_name","company_address","company_phone","company_email","company_gstin","invoice_footer","logo"]
-    if row:
-        return dict(zip(keys, row))
-    return {k: (None if k == "logo" else "") for k in keys}
+    if row: return dict(zip(keys, row))
+    return {k: (None if k=="logo" else "") for k in keys}
 
-def save_settings(data: dict):
+def save_settings(data):
     with get_conn() as conn:
-        conn.execute("""
-            UPDATE settings SET company_name=?, company_address=?, company_phone=?,
-                                company_email=?, company_gstin=?, invoice_footer=?, logo=?,
-                                updated_at=CURRENT_TIMESTAMP
-            WHERE id=1
-        """, (
-            data.get("company_name"), data.get("company_address"), data.get("company_phone"),
-            data.get("company_email"), data.get("company_gstin"), data.get("invoice_footer"),
-            data.get("logo"),
-        ))
+        conn.execute("""UPDATE settings SET company_name=?, company_address=?, company_phone=?, company_email=?, company_gstin=?, invoice_footer=?, logo=?, updated_at=CURRENT_TIMESTAMP
+                        WHERE id=1""",
+                     (data.get("company_name"), data.get("company_address"), data.get("company_phone"),
+                      data.get("company_email"), data.get("company_gstin"), data.get("invoice_footer"),
+                      data.get("logo")))
         conn.commit()
 
-def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-
-    # Users
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
-    """)
-
-    # Settings (drop CHECK for wider SQLite compatibility)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS settings(
-            id INTEGER PRIMARY KEY,
-            company_name TEXT,
-            company_address TEXT,
-            company_phone TEXT,
-            company_email TEXT,
-            company_gstin TEXT,
-            invoice_footer TEXT,
-            logo BLOB,
-            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
-    """)
-    cur.execute("INSERT OR IGNORE INTO settings(id, company_name, company_address) VALUES(1,'Your Company','Street, City, State, Pincode')")
-
-    # Products
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS products(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE,
-            category TEXT,
-            unit TEXT DEFAULT 'pcs',
-            selling_price REAL DEFAULT 0.0,
-            tax_rate REAL DEFAULT 0.0,
-            barcode TEXT,
-            low_stock_threshold REAL DEFAULT 0,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
-    """)
-    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode) WHERE barcode IS NOT NULL")
-
-    # Purchases
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS purchases(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-            qty REAL NOT NULL,
-            cost_price REAL DEFAULT 0.0,
-            bill_no TEXT,
-            supplier TEXT,
-            purchased_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            notes TEXT
-        );
-    """)
-
-    # Customers
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS customers(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE,
-            phone TEXT,
-            email TEXT,
-            gstin TEXT,
-            pan TEXT,
-            address TEXT,
-            city TEXT,
-            state TEXT,
-            pincode TEXT,
-            credit_limit REAL DEFAULT 0,
-            opening_balance REAL DEFAULT 0,
-            notes TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
-    """)
-
-    # Ledger (A/R)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS ledger(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
-            entry_type TEXT NOT NULL, -- sale, payment, adjustment
-            ref_id INTEGER,           -- sale_master id if sale
-            amount REAL NOT NULL,     -- +debit(sale), -credit(payment)
-            entry_date TEXT DEFAULT CURRENT_TIMESTAMP,
-            note TEXT
-        );
-    """)
-
-    # Multi-item sales
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS sale_master(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            invoice_no TEXT UNIQUE,
-            customer_id INTEGER REFERENCES customers(id),
-            sold_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            subtotal REAL DEFAULT 0,
-            tax_amount REAL DEFAULT 0,
-            total_amount REAL DEFAULT 0,
-            notes TEXT
-        );
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS sale_items(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sale_id INTEGER NOT NULL REFERENCES sale_master(id) ON DELETE CASCADE,
-            product_id INTEGER NOT NULL REFERENCES products(id),
-            description TEXT,
-            qty REAL NOT NULL,
-            unit_price REAL NOT NULL,
-            gst_rate REAL DEFAULT 0,
-            line_tax REAL DEFAULT 0,
-            line_total REAL DEFAULT 0
-        );
-    """)
-
-    # Default admin (admin / admin123)
-    cur = conn.execute("SELECT COUNT(*) FROM users")
-    if (cur.fetchone()[0] or 0) == 0:
-        conn.execute("INSERT INTO users(username, password_hash) VALUES(?,?)",
-                     ("admin", _hash_password("admin123")))
-
-    conn.commit()
-    conn.close()
-
-# ----------------------------
-# Auth
-# ----------------------------
-def verify_login(username: str, password: str) -> int | None:
-    with get_conn() as conn:
-        row = conn.execute("SELECT id, password_hash FROM users WHERE username=?", (username,)).fetchone()
-    if not row:
-        return None
-    uid, stored_hash = row
-    return int(uid) if _verify_password(password, stored_hash) else None
-
-def change_password(user_id: int, new_password: str):
-    with get_conn() as conn:
-        conn.execute("UPDATE users SET password_hash=? WHERE id=?", (_hash_password(new_password), user_id))
-        conn.commit()
-
-# ----------------------------
-# Business helpers
-# ----------------------------
 def get_or_create_customer(name, **fields):
     name = (name or "").strip()
-    if not name:
+    if not name: 
         return None
     with get_conn() as conn:
         cur = conn.execute("SELECT id FROM customers WHERE name=?", (name,)).fetchone()
@@ -242,7 +249,7 @@ def get_or_create_customer(name, **fields):
         cur = conn.execute("SELECT id FROM customers WHERE name=?", (name,)).fetchone()
         return int(cur[0])
 
-def get_customer_balance(customer_id: int, as_of: str | None = None) -> float:
+def get_customer_balance(customer_id, as_of=None):
     with get_conn() as conn:
         ob_row = conn.execute("SELECT COALESCE(opening_balance,0) FROM customers WHERE id=?", (customer_id,)).fetchone()
         ob = float(ob_row[0]) if ob_row else 0.0
@@ -254,7 +261,7 @@ def get_customer_balance(customer_id: int, as_of: str | None = None) -> float:
                               (customer_id,)).fetchone()[0]
         return round(ob + float(lg or 0), 2)
 
-def get_stock(product_id: int) -> float:
+def get_stock(product_id):
     with get_conn() as conn:
         p = conn.execute("SELECT COALESCE(SUM(qty),0) FROM purchases WHERE product_id=?", (product_id,)).fetchone()[0]
         s = conn.execute("SELECT COALESCE(SUM(qty),0) FROM sale_items WHERE product_id=?", (product_id,)).fetchone()[0]
@@ -301,14 +308,13 @@ def add_purchase(product_id, qty, cp, bill_no, supplier, when, notes):
 
 def next_invoice_no():
     with get_conn() as conn:
-        n = conn.execute("SELECT COUNT(*) FROM sale_master").fetchone()[0]
+        cur = conn.execute("SELECT COUNT(*) FROM sale_master").fetchone()[0]
     now = datetime.now().strftime("%Y%m")
-    return f"INV-{now}-{int(n)+1:04d}"
+    return f"INV-{now}-{int(cur)+1:04d}"
 
 def add_sale_multi(customer_id, sold_at, items, invoice_no, notes, payment_received):
     with get_conn() as conn:
         subtotal = 0.0; tax_total = 0.0; total_amount = 0.0
-        # calculate/validate
         for it in items:
             qty = float(it["qty"]); price = float(it["unit_price"]); gst = float(it["gst_rate"])
             if qty <= 0: raise ValueError("Quantity must be > 0")
@@ -320,13 +326,11 @@ def add_sale_multi(customer_id, sold_at, items, invoice_no, notes, payment_recei
             line_total = round(line_sub + line_tax, 2)
             subtotal += line_sub; tax_total += line_tax; total_amount += line_total
 
-        # master
         conn.execute("""INSERT INTO sale_master(invoice_no, customer_id, sold_at, subtotal, tax_amount, total_amount, notes)
                         VALUES(?,?,?,?,?,?,?)""",
                      (invoice_no, customer_id, sold_at, round(subtotal,2), round(tax_total,2), round(total_amount,2), notes))
         sale_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
-        # items
         for it in items:
             qty = float(it["qty"]); price = float(it["unit_price"]); gst = float(it["gst_rate"])
             line_sub = qty * price
@@ -337,7 +341,6 @@ def add_sale_multi(customer_id, sold_at, items, invoice_no, notes, payment_recei
                             VALUES(?,?,?,?,?,?,?,?)""",
                          (sale_id, int(it["product_id"]), desc, qty, price, gst, line_tax, line_total))
 
-        # ledger entries
         conn.execute("""INSERT INTO ledger(customer_id, entry_type, ref_id, amount, entry_date, note)
                         VALUES(?,?,?,?,?,?)""",
                      (customer_id, "sale", sale_id, round(total_amount,2), sold_at, f"Invoice {invoice_no}"))
@@ -346,7 +349,6 @@ def add_sale_multi(customer_id, sold_at, items, invoice_no, notes, payment_recei
             conn.execute("""INSERT INTO ledger(customer_id, entry_type, ref_id, amount, entry_date, note)
                             VALUES(?,?,?,?,?,?)""",
                          (customer_id, "payment", sale_id, amt, sold_at, f"Against {invoice_no}"))
-
         conn.commit()
         return int(sale_id), round(subtotal,2), round(tax_total,2), round(total_amount,2)
 
@@ -400,7 +402,7 @@ def reset_cache():
     load_customers.clear()
 
 # ----------------------------
-# PDF builders
+# PDF Builders
 # ----------------------------
 def make_invoice_pdf_multi(sale_row, items_df, settings):
     if not REPORTLAB_OK:
@@ -410,7 +412,6 @@ def make_invoice_pdf_multi(sale_row, items_df, settings):
     W, H = A4
     x = 20*mm; y = H - 20*mm
 
-    # Header with optional logo
     logo_bytes = settings.get("logo")
     x_text = x
     if logo_bytes:
@@ -451,7 +452,7 @@ def make_invoice_pdf_multi(sale_row, items_df, settings):
         c.drawRightString(W-130, y, f"{float(r.get('qty',0)):.2f}")
         c.drawRightString(W-100, y, f"{float(r.get('unit_price',0)):.2f}")
         c.drawRightString(W-70, y, f"{float(r.get('gst_rate',0)):.0f}")
-        amount = float(r.get("qty",0)) * float(r.get("unit_price",0))
+        amount = float(r.get("qty",0))*float(r.get("unit_price",0))
         c.drawRightString(W-30, y, f"{amount:.2f}")
         y -= 14
 
@@ -529,8 +530,389 @@ def customer_statement_pdf(customer_row, ledger_df, opening_balance, settings, d
     c.showPage(); c.save(); buf.seek(0)
     return buf.getvalue()
 
+def export_reports_excel(dfp, sales_master, sales_items, stock, balances):
+    out = BytesIO()
+    with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
+        if dfp is not None and not dfp.empty:
+            dfp.to_excel(writer, index=False, sheet_name="Purchases")
+        if sales_master is not None and not sales_master.empty:
+            sales_master.to_excel(writer, index=False, sheet_name="SalesMaster")
+        if sales_items is not None and not sales_items.empty:
+            sales_items.to_excel(writer, index=False, sheet_name="SalesItems")
+        if stock is not None and not stock.empty:
+            stock.to_excel(writer, index=False, sheet_name="Stock")
+        if balances is not None and not balances.empty:
+            balances.to_excel(writer, index=False, sheet_name="CustomerBalances")
+    out.seek(0)
+    return out
+
 # ----------------------------
-# UI pieces
+# UI Helpers (sections)
+# ----------------------------
+def ui_dashboard():
+    st.subheader("Overview")
+    items_cnt, qty, value, low_items = simple_kpis()
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Products", items_cnt)
+    c2.metric("Total Stock (qty)", f"{qty:.2f}")
+    c3.metric("Inventory Value (₹)", f"{value:,.2f}")
+    c4.metric("Low-stock Items", low_items)
+
+    st.divider()
+    st.subheader("🔺 Top Customers by Outstanding Credit")
+    custs = load_customers()
+    rows = []
+    for _, r in custs.iterrows():
+        bal = get_customer_balance(int(r["id"]))
+        rows.append([r["id"], r["name"], r["phone"], r["city"], r["state"], bal])
+    top_bal = pd.DataFrame(rows, columns=["CustomerID","Name","Phone","City","State","Outstanding"])
+    if not top_bal.empty:
+        top_bal = top_bal.sort_values("Outstanding", ascending=False)
+        st.dataframe(top_bal.head(10), use_container_width=True)
+    else:
+        st.info("No customers yet.")
+
+    st.divider()
+    st.subheader("🔻 Lowest Stock Items")
+    s = stock_df()
+    if not s.empty:
+        s2 = s.sort_values("In Stock", ascending=True)
+        st.dataframe(s2.head(10), use_container_width=True)
+    else:
+        st.info("No products yet.")
+
+def ui_products():
+    st.subheader("Products")
+    prods = load_products()
+    with st.form("add_prod"):
+        c1, c2, c3, c4 = st.columns(4)
+        name = c1.text_input("Product name*")
+        category = c2.text_input("Category")
+        unit = c3.text_input("Unit", value="pcs")
+        price = c4.number_input("Selling price (pre-tax)", min_value=0.0, step=1.0)
+        c5, c6, c7 = st.columns(3)
+        barcode = c5.text_input("Barcode (optional)")
+        low_thr = c6.number_input("Low Stock Threshold", min_value=0.0, step=1.0)
+        tax_rate = c7.number_input("GST %", min_value=0.0, step=1.0, help="e.g., 0, 5, 12, 18, 28")
+        if st.form_submit_button("Save Product"):
+            if not name.strip():
+                st.error("Name is required.")
+            else:
+                save_product(name, category, unit, price, barcode, low_thr, tax_rate)
+                st.success("Saved."); reset_cache()
+
+    st.divider()
+    if not prods.empty:
+        st.write("Existing Products")
+        st.dataframe(prods[["id","name","category","unit","selling_price","tax_rate","barcode","low_stock_threshold","created_at"]], use_container_width=True)
+        st.write("Edit / Delete")
+        sel = st.selectbox("Choose product", options=prods["id"], format_func=lambda i: prods.set_index("id").loc[i, "name"])
+        if sel:
+            rec = prods[prods["id"]==sel].iloc[0]
+            n = st.text_input("Name", rec["name"])
+            cat = st.text_input("Category", rec["category"] or "")
+            un = st.text_input("Unit", rec["unit"] or "pcs")
+            pr = st.number_input("Selling Price (pre-tax)", min_value=0.0, value=float(rec["selling_price"] or 0), step=1.0)
+            bc = st.text_input("Barcode", rec.get("barcode") or "")
+            lt = st.number_input("Low Stock Threshold", min_value=0.0, value=float(rec.get("low_stock_threshold") or 0), step=1.0)
+            tr = st.number_input("GST %", min_value=0.0, value=float(rec.get("tax_rate") or 0), step=1.0)
+            colA, colB = st.columns(2)
+            if colA.button("Update"):
+                update_product(int(sel), n, cat, un, pr, bc, lt, tr)
+                st.success("Updated."); reset_cache()
+            if colB.button("Delete", type="primary"):
+                delete_product(int(sel))
+                st.success("Deleted."); reset_cache()
+
+def ui_customers():
+    st.subheader("Customers")
+    custs = load_customers()
+    with st.form("add_cust"):
+        c1, c2 = st.columns(2)
+        cname = c1.text_input("Customer name*")
+        cphone = c2.text_input("Phone")
+        cemail = c2.text_input("Email")
+        caddr = st.text_area("Address")
+        c3, c4, c5 = st.columns(3)
+        city = c3.text_input("City")
+        state = c4.text_input("State")
+        pin = c5.text_input("Pincode")
+        c6, c7 = st.columns(2)
+        gstin = c6.text_input("GSTIN")
+        pan = c7.text_input("PAN")
+        c8, c9 = st.columns(2)
+        credit = c8.number_input("Credit limit", min_value=0.0, step=1.0)
+        cob = c9.number_input("Opening balance (positive = receivable)", min_value=0.0, step=1.0)
+        notes = st.text_area("Notes")
+        if st.form_submit_button("Save Customer"):
+            if not cname.strip():
+                st.error("Name required")
+            else:
+                with get_conn() as conn:
+                    cur = conn.execute("SELECT id FROM customers WHERE name=?", (cname.strip(),)).fetchone()
+                    if cur:
+                        conn.execute("""UPDATE customers SET phone=?, email=?, gstin=?, pan=?, address=?, city=?, state=?, pincode=?, credit_limit=?, opening_balance=?, notes=? WHERE id=?""",
+                                     (cphone, cemail, gstin, pan, caddr, city, state, pin, credit, cob, notes, int(cur[0])))
+                    else:
+                        conn.execute("""INSERT INTO customers(name, phone, email, gstin, pan, address, city, state, pincode, credit_limit, opening_balance, notes)
+                                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                     (cname.strip(), cphone, cemail, gstin, pan, caddr, city, state, pin, credit, cob, notes))
+                    conn.commit()
+                st.success("Customer saved."); reset_cache()
+    st.divider()
+    if not custs.empty:
+        st.dataframe(custs, use_container_width=True)
+
+def ui_purchases():
+    st.subheader("Record Purchase")
+    prods = load_products()
+    if prods.empty:
+        st.info("Add a product first in the Products section.")
+        return
+    c1, c2 = st.columns(2)
+    prod = c1.selectbox("Product", options=prods["id"], format_func=lambda i: prods.set_index("id").loc[i, "name"])
+    qty = c2.number_input("Quantity (+)", min_value=0.0, step=1.0)
+    c3, c4, c5 = st.columns(3)
+    cp = c3.number_input("Cost price (per unit)", min_value=0.0, step=1.0)
+    bill = c4.text_input("Bill No.")
+    supplier = c5.text_input("Supplier")
+    c6, c7 = st.columns(2)
+    when = c6.date_input("Purchased on", value=date.today())
+    notes = c7.text_input("Notes")
+    if st.button("Add Purchase"):
+        if qty <= 0:
+            st.error("Quantity must be > 0")
+        else:
+            add_purchase(int(prod), qty, cp, bill, supplier, when.isoformat(), notes)
+            st.success("Purchase recorded. Stock increased."); reset_cache()
+    st.divider()
+    st.subheader("Recent Purchases")
+    dfp = list_purchases()
+    st.dataframe(dfp, use_container_width=True)
+
+def ui_sales():
+    st.subheader("Create Invoice (Multi-item)")
+    prods = load_products(); custs = load_customers()
+
+    csel1, csel2 = st.columns(2)
+    mode = csel1.radio("Customer mode", ["Select existing","Type new"], horizontal=True)
+    if mode == "Select existing" and not custs.empty:
+        cust_id = csel1.selectbox("Customer", options=custs["id"], format_func=lambda i: custs.set_index("id").loc[i, "name"])
+        cust_name = custs.set_index("id").loc[cust_id, "name"]
+    else:
+        cust_name = csel2.text_input("New Customer Name")
+        cust_id = None
+
+    last_balance = 0.0
+    if mode == "Select existing" and custs is not None and not custs.empty:
+        last_balance = get_customer_balance(int(cust_id))
+    st.info(f"Customer last balance: ₹ {last_balance:,.2f} (positive = receivable)")
+
+    if "cart" not in st.session_state:
+        st.session_state.cart = []
+
+    st.markdown("**Add Item**")
+    if prods.empty:
+        st.warning("Add products first.")
+    else:
+        p1, p2, p3, p4 = st.columns(4)
+        pid = p1.selectbox("Product", options=prods["id"], format_func=lambda i: prods.set_index("id").loc[i, "name"])
+        default_sp = float(prods.set_index("id").loc[pid,"selling_price"] or 0)
+        default_gst = float(prods.set_index("id").loc[pid,"tax_rate"] or 0)
+        qty = p2.number_input("Qty", min_value=0.0, step=1.0)
+        price = p3.number_input("Unit Price (pre-tax)", min_value=0.0, step=1.0, value=default_sp)
+        gst = p4.number_input("GST %", min_value=0.0, step=1.0, value=default_gst)
+        desc = st.text_input("Description (optional)")
+        if st.button("Add to Cart"):
+            st.session_state.cart.append({"product_id": int(pid), "qty": float(qty), "unit_price": float(price), "gst_rate": float(gst), "description": desc})
+            st.success("Added to cart.")
+
+    if st.session_state.cart:
+        cart_rows = []
+        for idx, it in enumerate(st.session_state.cart, start=1):
+            name = prods.set_index("id").loc[it["product_id"], "name"] if not prods.empty else str(it["product_id"])
+            line_sub = it["qty"]*it["unit_price"]
+            line_tax = round(line_sub * it["gst_rate"]/100.0, 2)
+            line_total = round(line_sub + line_tax, 2)
+            cart_rows.append([idx, name, it["qty"], it["unit_price"], it["gst_rate"], line_tax, line_total])
+        df_cart = pd.DataFrame(cart_rows, columns=["#","Product","Qty","Unit Price","GST %","Line Tax","Line Total"])
+        st.dataframe(df_cart, use_container_width=True)
+        subtotal = (df_cart["Qty"]*df_cart["Unit Price"]).sum()
+        tax_total = df_cart["Line Tax"].sum()
+        total_amount = df_cart["Line Total"].sum()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Subtotal", f"₹ {subtotal:,.2f}")
+        c2.metric("GST", f"₹ {tax_total:,.2f}")
+        c3.metric("Total", f"₹ {total_amount:,.2f}")
+    else:
+        st.info("Cart is empty.")
+
+    inv1, inv2 = st.columns(2)
+    invoice_no = inv1.text_input("Invoice No.", value=next_invoice_no())
+    sold_on = inv2.date_input("Invoice date", value=date.today())
+    notes = st.text_input("Notes")
+    paid_now = st.number_input("Amount received now (optional)", min_value=0.0, step=1.0, value=0.0)
+
+    colA, colB = st.columns(2)
+    if colA.button("Save Invoice"):
+        if mode == "Type new":
+            if not cust_name.strip():
+                st.error("Enter customer name or select existing.")
+                st.stop()
+            customer_id = get_or_create_customer(cust_name.strip())
+        else:
+            customer_id = int(cust_id)
+
+        if not st.session_state.cart:
+            st.error("Cart is empty."); st.stop()
+        try:
+            sale_id, sub, tax, tot = add_sale_multi(
+                customer_id=customer_id,
+                sold_at=sold_on.isoformat(),
+                items=st.session_state.cart,
+                invoice_no=invoice_no,
+                notes=notes,
+                payment_received=paid_now
+            )
+            st.success(f"Invoice saved (#{sale_id}).")
+            st.session_state.cart = []
+            reset_cache()
+        except Exception as e:
+            st.error(f"Failed to save sale: {e}")
+
+    if colB.button("Clear Cart"):
+        st.session_state.cart = []
+        st.success("Cart cleared.")
+
+    st.divider()
+    st.subheader("Recent Invoices & PDF")
+    sm = list_sales_master()
+    st.dataframe(sm, use_container_width=True)
+
+    settings = load_settings()
+    if sm is not None and not sm.empty:
+        sale_ids = sm["id"].tolist()
+        sel_sale = st.selectbox("Select invoice", options=sale_ids, format_func=lambda i: f"{int(i)} — {sm.set_index('id').loc[i, 'invoice_no']}")
+        if st.button("Create PDF Invoice"):
+            row = sm.set_index("id").loc[sel_sale].to_dict()
+            items = list_sales_items(sel_sale)
+            pdf_bytes = make_invoice_pdf_multi(row, items, settings)
+            st.download_button("Download Invoice PDF", data=pdf_bytes, file_name=f"{row.get('invoice_no','invoice')}.pdf", mime="application/pdf")
+
+def ui_stock():
+    st.subheader("Current Stock")
+    s = stock_df()
+    st.dataframe(s, use_container_width=True)
+    st.download_button("Download Stock CSV", data=s.to_csv(index=False).encode("utf-8"), file_name="stock.csv", mime="text/csv")
+
+def ui_reports():
+    st.subheader("Reports & Exports")
+    r1, r2 = st.columns(2)
+    dfrom = r1.date_input("From", value=date.today().replace(day=1))
+    dto = r2.date_input("To", value=date.today())
+
+    dfp = list_purchases(dfrom.isoformat(), dto.isoformat())
+    sm = list_sales_master(dfrom.isoformat(), dto.isoformat())
+
+    st.markdown("**Purchases**"); st.dataframe(dfp, use_container_width=True)
+    st.markdown("**Sales (Invoices)**"); st.dataframe(sm, use_container_width=True)
+
+    st.markdown("**Sales Items (choose invoice)**")
+    if sm is not None and not sm.empty:
+        sid = st.selectbox("Invoice", options=sm["id"], format_func=lambda i: sm.set_index("id").loc[i, "invoice_no"], key="rep_items_sel")
+        si = list_sales_items(int(sid))
+        st.dataframe(si, use_container_width=True)
+    else:
+        si = pd.DataFrame()
+
+    st.markdown("**Customer Balances (as of To date)**")
+    custs = load_customers()
+    rows = []
+    for _, r in custs.iterrows():
+        bal = get_customer_balance(int(r["id"]), as_of=dto.isoformat())
+        rows.append([r["id"], r["name"], r["phone"], r["email"], r["gstin"], r["city"], r["state"], r["pincode"], bal])
+    balances = pd.DataFrame(rows, columns=["CustomerID","Name","Phone","Email","GSTIN","City","State","Pincode","Balance"])
+    st.dataframe(balances, use_container_width=True)
+
+    stock = stock_df()
+    excel_bytes = export_reports_excel(dfp, sm, si, stock, balances)
+    st.download_button("Download reports.xlsx", data=excel_bytes, file_name="reports.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.download_button("Download purchases.csv", data=dfp.to_csv(index=False).encode("utf-8"), file_name="purchases.csv", mime="text/csv")
+    st.download_button("Download sales_master.csv", data=sm.to_csv(index=False).encode("utf-8"), file_name="sales_master.csv", mime="text/csv")
+    st.download_button("Download sales_items.csv", data=si.to_csv(index=False).encode("utf-8"), file_name="sales_items.csv", mime="text/csv")
+    st.download_button("Download customer_balances.csv", data=balances.to_csv(index=False).encode("utf-8"), file_name="customer_balances.csv", mime="text/csv")
+
+    st.divider()
+    st.subheader("Customer Statement PDF")
+    if not custs.empty:
+        cust_for_stmt = st.selectbox("Customer", options=custs["id"], format_func=lambda i: custs.set_index("id").loc[i, "name"])
+        opening = get_customer_balance(int(cust_for_stmt), as_of=dfrom.isoformat())
+        with get_conn() as conn:
+            ledger_df = pd.read_sql_query(
+                "SELECT entry_date, entry_type, note, amount FROM ledger WHERE customer_id=? AND DATE(entry_date) >= DATE(?) AND DATE(entry_date) <= DATE(?) ORDER BY entry_date",
+                conn, params=(int(cust_for_stmt), dfrom.isoformat(), dto.isoformat())
+            )
+        settings = load_settings()
+        if st.button("Download Statement PDF"):
+            cust_row = custs[custs["id"]==int(cust_for_stmt)].iloc[0].to_dict()
+            pdf = customer_statement_pdf(cust_row, ledger_df, opening, settings, dfrom.isoformat(), dto.isoformat())
+            st.download_button("Save statement.pdf", data=pdf, file_name=f"statement_{cust_row.get('name','customer')}.pdf", mime="application/pdf")
+
+def ui_settings():
+    st.subheader("Company & Invoice Settings")
+    settings = load_settings()
+    with st.form("settings_form"):
+        c1, c2 = st.columns(2)
+        company_name = c1.text_input("Company Name", value=settings.get("company_name",""))
+        company_phone = c2.text_input("Phone", value=settings.get("company_phone",""))
+        company_email = c2.text_input("Email", value=settings.get("company_email",""))
+        company_gstin = c1.text_input("GSTIN", value=settings.get("company_gstin",""))
+        company_address = st.text_area("Address", value=settings.get("company_address",""))
+        invoice_footer = st.text_area("Invoice Footer (notes/terms)", value=settings.get("invoice_footer",""))
+        logo_file = st.file_uploader("Logo (PNG/JPG)", type=["png","jpg","jpeg"])
+        logo_bytes = settings.get("logo")
+        if logo_file is not None:
+            logo_bytes = logo_file.read()
+        if st.form_submit_button("Save Settings"):
+            save_settings({
+                "company_name": company_name,
+                "company_address": company_address,
+                "company_phone": company_phone,
+                "company_email": company_email,
+                "company_gstin": company_gstin,
+                "invoice_footer": invoice_footer,
+                "logo": logo_bytes
+            })
+            st.success("Settings saved.")
+
+    st.subheader("Security")
+    with st.form("pwd_change"):
+        newpwd = st.text_input("New password", type="password")
+        newpwd2 = st.text_input("Confirm password", type="password")
+        if st.form_submit_button("Change Password"):
+            if not newpwd or newpwd != newpwd2:
+                st.error("Passwords do not match")
+            else:
+                change_password(st.session_state["user_id"], newpwd)
+                st.success("Password updated.")
+
+    st.divider()
+    st.subheader("Reset admin password")
+    st.caption("Use if you migrated from older code and cannot sign in.")
+    if st.button("Reset to admin/admin123"):
+        reset_admin_password("admin123")
+        st.success("Admin reset to admin / admin123")
+
+    st.caption("SQLite DB: inventory.db")
+    try:
+        with open(DB_PATH, "rb") as f:
+            st.download_button("Download Database (inventory.db)", f, file_name="inventory.db")
+    except FileNotFoundError:
+        st.info("DB will be created on first write.")
+
+# ----------------------------
+# LOGIN GATE + SIDEBAR NAV
 # ----------------------------
 def login_gate():
     st.title("🔒 Login")
@@ -545,386 +927,47 @@ def login_gate():
             st.rerun()
         else:
             st.error("Invalid credentials")
+    st.info("If login fails after upgrading, delete `inventory.db` once or use Settings → Reset admin password (on a fresh DB).")
 
-# ----------------------------
-# Main App
-# ----------------------------
 def main():
-    st.set_page_config(page_title="Inventory (Login + Multi-item + PDFs)", page_icon="📦", layout="wide")
+    st.set_page_config(page_title="Inventory (Sidebar + Dashboard Enhancements)", page_icon="📦", layout="wide")
     init_db()
 
+    # auth
     if "user_id" not in st.session_state:
         login_gate()
         return
 
-    st.sidebar.success(f"Logged in as {st.session_state.get('username','')}")
+    # Sidebar nav (top-left)
+    st.sidebar.title("📦 Inventory")
+    st.sidebar.success(f"Hello, {st.session_state.get('username','')}")
+    page = st.sidebar.radio(
+        "Navigate",
+        ["Dashboard", "Products", "Customers", "Purchase", "Sales", "Stock", "Reports", "Settings"],
+        index=0
+    )
     if st.sidebar.button("Logout"):
         for k in ["user_id","username","cart"]:
             if k in st.session_state: del st.session_state[k]
         st.rerun()
 
-    st.title("📦 Simple Inventory App")
-    tabs = st.tabs(["1) Dashboard", "2) Products", "3) Customers", "4) Purchase", "5) Sales", "6) Stock", "7) Reports", "8) Settings"])
-
-    # 1) Dashboard
-    with tabs[0]:
-        items_cnt, qty, value, low_items = simple_kpis()
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Total Products", items_cnt)
-        c2.metric("Total Stock (all items)", f"{qty:.2f}")
-        c3.metric("Est. Inventory Value", f"₹ {value:,.2f}")
-        c4.metric("Low-stock Items", low_items)
-        st.subheader("Quick Stock Snapshot")
-        df = stock_df()
-        only_low = st.toggle("Show only Low-stock items", value=False)
-        if only_low: df = df[df["Low?"]=="YES"]
-        st.dataframe(df, use_container_width=True)
-
-    # 2) Products
-    with tabs[1]:
-        st.subheader("Add / Edit Products")
-        prods = load_products()
-        with st.form("add_prod"):
-            c1, c2, c3, c4 = st.columns(4)
-            name = c1.text_input("Product name*")
-            category = c2.text_input("Category")
-            unit = c3.text_input("Unit", value="pcs")
-            price = c4.number_input("Selling price (pre-tax)", min_value=0.0, step=1.0)
-            c5, c6, c7 = st.columns(3)
-            barcode = c5.text_input("Barcode (optional)")
-            low_thr = c6.number_input("Low Stock Threshold", min_value=0.0, step=1.0)
-            tax_rate = c7.number_input("GST %", min_value=0.0, step=1.0, help="e.g., 0, 5, 12, 18, 28")
-            if st.form_submit_button("Save Product"):
-                if not name.strip():
-                    st.error("Name is required.")
-                else:
-                    save_product(name, category, unit, price, barcode, low_thr, tax_rate)
-                    st.success("Saved."); reset_cache()
-        st.divider()
-
-        if not prods.empty:
-            st.write("Existing Products")
-            st.dataframe(prods[["id","name","category","unit","selling_price","tax_rate","barcode","low_stock_threshold","created_at"]], use_container_width=True)
-            st.write("Edit / Delete")
-            sel = st.selectbox("Choose product", options=prods["id"], format_func=lambda i: prods.set_index("id").loc[i, "name"])
-            if sel:
-                rec = prods[prods["id"]==sel].iloc[0]
-                n = st.text_input("Name", rec["name"])
-                cat = st.text_input("Category", rec["category"] or "")
-                un = st.text_input("Unit", rec["unit"] or "pcs")
-                pr = st.number_input("Selling Price (pre-tax)", min_value=0.0, value=float(rec["selling_price"] or 0), step=1.0)
-                bc = st.text_input("Barcode", rec.get("barcode") or "")
-                lt = st.number_input("Low Stock Threshold", min_value=0.0, value=float(rec.get("low_stock_threshold") or 0), step=1.0)
-                tr = st.number_input("GST %", min_value=0.0, value=float(rec.get("tax_rate") or 0), step=1.0)
-                colA, colB = st.columns(2)
-                if colA.button("Update"):
-                    update_product(int(sel), n, cat, un, pr, bc, lt, tr)
-                    st.success("Updated."); reset_cache()
-                if colB.button("Delete", type="primary"):
-                    delete_product(int(sel))
-                    st.success("Deleted."); reset_cache()
-
-    # 3) Customers
-    with tabs[2]:
-        st.subheader("Add / Edit Customers")
-        custs = load_customers()
-        with st.form("add_cust"):
-            c1, c2 = st.columns(2)
-            cname = c1.text_input("Customer name*")
-            cphone = c2.text_input("Phone")
-            cemail = c2.text_input("Email")
-            caddr = st.text_area("Address")
-            c3, c4, c5 = st.columns(3)
-            city = c3.text_input("City")
-            state = c4.text_input("State")
-            pin = c5.text_input("Pincode")
-            c6, c7 = st.columns(2)
-            gstin = c6.text_input("GSTIN")
-            pan = c7.text_input("PAN")
-            c8, c9 = st.columns(2)
-            credit = c8.number_input("Credit limit", min_value=0.0, step=1.0)
-            cob = c9.number_input("Opening balance (positive = receivable)", min_value=0.0, step=1.0)
-            notes = st.text_area("Notes")
-            if st.form_submit_button("Save Customer"):
-                if not cname.strip():
-                    st.error("Name required")
-                else:
-                    with get_conn() as conn:
-                        cur = conn.execute("SELECT id FROM customers WHERE name=?", (cname.strip(),)).fetchone()
-                        if cur:
-                            conn.execute("""UPDATE customers
-                                            SET phone=?, email=?, gstin=?, pan=?, address=?, city=?, state=?, pincode=?,
-                                                credit_limit=?, opening_balance=?, notes=?
-                                            WHERE id=?""",
-                                         (cphone, cemail, gstin, pan, caddr, city, state, pin,
-                                          credit, cob, notes, int(cur[0])))
-                        else:
-                            conn.execute("""INSERT INTO customers(name, phone, email, gstin, pan, address, city, state, pincode, credit_limit, opening_balance, notes)
-                                            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                                         (cname.strip(), cphone, cemail, gstin, pan, caddr, city, state, pin, credit, cob, notes))
-                        conn.commit()
-                    st.success("Customer saved."); reset_cache()
-        st.divider()
-        if not custs.empty:
-            st.write("Customers")
-            st.dataframe(custs, use_container_width=True)
-
-    # 4) Purchase
-    with tabs[3]:
-        st.subheader("Record Purchase")
-        prods = load_products()
-        if prods.empty:
-            st.info("Add a product first in the Products tab.")
-        else:
-            c1, c2 = st.columns(2)
-            prod = c1.selectbox("Product", options=prods["id"], format_func=lambda i: prods.set_index("id").loc[i, "name"])
-            qty = c2.number_input("Quantity (+)", min_value=0.0, step=1.0)
-            c3, c4, c5 = st.columns(3)
-            cp = c3.number_input("Cost price (per unit)", min_value=0.0, step=1.0)
-            bill = c4.text_input("Bill No.")
-            supplier = c5.text_input("Supplier")
-            c6, c7 = st.columns(2)
-            when = c6.date_input("Purchased on", value=date.today())
-            notes = c7.text_input("Notes")
-            if st.button("Add Purchase"):
-                if qty <= 0:
-                    st.error("Quantity must be > 0")
-                else:
-                    add_purchase(int(prod), qty, cp, bill, supplier, when.isoformat(), notes)
-                    st.success("Purchase recorded. Stock increased."); reset_cache()
-        st.divider()
-        st.subheader("Recent Purchases")
-        dfp = list_purchases()
-        st.dataframe(dfp, use_container_width=True)
-
-    # 5) Sales (Multi-item)
-    with tabs[4]:
-        st.subheader("Create Invoice (Multi-item)")
-        prods = load_products(); custs = load_customers()
-
-        # Customer selection
-        csel1, csel2 = st.columns(2)
-        mode = csel1.radio("Customer mode", ["Select existing","Type new"], horizontal=True)
-        if mode == "Select existing" and not custs.empty:
-            cust_id = csel1.selectbox("Customer", options=custs["id"], format_func=lambda i: custs.set_index("id").loc[i, "name"])
-            cust_name = custs.set_index("id").loc[cust_id, "name"]
-        else:
-            cust_name = csel2.text_input("New Customer Name")
-            cust_id = None
-
-        # Balance
-        last_balance = 0.0
-        if mode == "Select existing" and not custs.empty:
-            last_balance = get_customer_balance(int(cust_id))
-        st.info(f"Customer last balance: ₹ {last_balance:,.2f} (positive = receivable)")
-
-        # Cart
-        if "cart" not in st.session_state:
-            st.session_state.cart = []
-
-        st.markdown("**Add Item**")
-        if prods.empty:
-            st.warning("Add products first.")
-        else:
-            p1, p2, p3, p4 = st.columns(4)
-            pid = p1.selectbox("Product", options=prods["id"], format_func=lambda i: prods.set_index("id").loc[i, "name"])
-            default_sp = float(prods.set_index("id").loc[pid,"selling_price"] or 0)
-            default_gst = float(prods.set_index("id").loc[pid,"tax_rate"] or 0)
-            qty = p2.number_input("Qty", min_value=0.0, step=1.0)
-            price = p3.number_input("Unit Price (pre-tax)", min_value=0.0, step=1.0, value=default_sp)
-            gst = p4.number_input("GST %", min_value=0.0, step=1.0, value=default_gst)
-            desc = st.text_input("Description (optional)")
-            if st.button("Add to Cart"):
-                st.session_state.cart.append({"product_id": int(pid), "qty": float(qty), "unit_price": float(price), "gst_rate": float(gst), "description": desc})
-                st.success("Added to cart.")
-
-        if st.session_state.cart:
-            rows = []
-            for idx, it in enumerate(st.session_state.cart, start=1):
-                name = prods.set_index("id").loc[it["product_id"], "name"] if not prods.empty else str(it["product_id"])
-                line_sub = it["qty"] * it["unit_price"]
-                line_tax = round(line_sub * it["gst_rate"]/100.0, 2)
-                line_total = round(line_sub + line_tax, 2)
-                rows.append([idx, name, it["qty"], it["unit_price"], it["gst_rate"], line_tax, line_total])
-            df_cart = pd.DataFrame(rows, columns=["#","Product","Qty","Unit Price","GST %","Line Tax","Line Total"])
-            st.dataframe(df_cart, use_container_width=True)
-            subtotal = (df_cart["Qty"]*df_cart["Unit Price"]).sum()
-            tax_total = df_cart["Line Tax"].sum()
-            total_amount = df_cart["Line Total"].sum()
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Subtotal", f"₹ {subtotal:,.2f}")
-            c2.metric("GST", f"₹ {tax_total:,.2f}")
-            c3.metric("Total", f"₹ {total_amount:,.2f}")
-        else:
-            st.info("Cart is empty.")
-
-        inv1, inv2 = st.columns(2)
-        invoice_no = inv1.text_input("Invoice No.", value=next_invoice_no())
-        sold_on = inv2.date_input("Invoice date", value=date.today())
-        notes = st.text_input("Notes")
-        paid_now = st.number_input("Amount received now (optional)", min_value=0.0, step=1.0, value=0.0)
-
-        colA, colB = st.columns(2)
-        if colA.button("Save Invoice"):
-            if mode == "Type new":
-                if not cust_name.strip():
-                    st.error("Enter customer name or select existing.")
-                    st.stop()
-                customer_id = get_or_create_customer(cust_name.strip())
-            else:
-                customer_id = int(cust_id)
-
-            if not st.session_state.cart:
-                st.error("Cart is empty."); st.stop()
-            try:
-                sale_id, sub, tax, tot = add_sale_multi(
-                    customer_id=customer_id,
-                    sold_at=sold_on.isoformat(),
-                    items=st.session_state.cart,
-                    invoice_no=invoice_no,
-                    notes=notes,
-                    payment_received=paid_now
-                )
-                st.success(f"Invoice saved (#{sale_id}).")
-                st.session_state.cart = []
-                reset_cache()
-            except Exception as e:
-                st.error(f"Failed to save sale: {e}")
-
-        if colB.button("Clear Cart"):
-            st.session_state.cart = []
-            st.success("Cart cleared.")
-
-        st.divider()
-        st.subheader("Recent Invoices")
-        sm = list_sales_master()
-        st.dataframe(sm, use_container_width=True)
-
-        st.markdown("### Generate PDF Invoice")
-        settings = load_settings()
-        if sm is not None and not sm.empty:
-            sale_ids = sm["id"].tolist()
-            sel_sale = st.selectbox("Select invoice", options=sale_ids, format_func=lambda i: f"{int(i)} — {sm.set_index('id').loc[i, 'invoice_no']}")
-            if st.button("Create PDF Invoice"):
-                row = sm.set_index("id").loc[sel_sale].to_dict()
-                items = list_sales_items(sel_sale)
-                if not REPORTLAB_OK:
-                    st.error("ReportLab not installed. Add 'reportlab' to requirements.")
-                else:
-                    pdf_bytes = make_invoice_pdf_multi(row, items, settings)
-                    st.download_button("Download Invoice PDF", data=pdf_bytes, file_name=f"{row.get('invoice_no','invoice')}.pdf", mime="application/pdf")
-
-    # 6) Stock
-    with tabs[5]:
-        st.subheader("Current Stock")
-        s = stock_df()
-        st.dataframe(s, use_container_width=True)
-        st.download_button("Download Stock CSV", data=s.to_csv(index=False).encode("utf-8"), file_name="stock.csv", mime="text/csv")
-
-    # 7) Reports
-    with tabs[6]:
-        st.subheader("Reports & Exports")
-        r1, r2 = st.columns(2)
-        dfrom = r1.date_input("From", value=date.today().replace(day=1))
-        dto = r2.date_input("To", value=date.today())
-
-        dfp = list_purchases(dfrom.isoformat(), dto.isoformat())
-        sm = list_sales_master(dfrom.isoformat(), dto.isoformat())
-
-        st.markdown("**Purchases**"); st.dataframe(dfp, use_container_width=True)
-        st.markdown("**Sales (Invoices)**"); st.dataframe(sm, use_container_width=True)
-
-        st.markdown("**Sales Items (choose invoice)**")
-        if sm is not None and not sm.empty:
-            sid = st.selectbox("Invoice", options=sm["id"], format_func=lambda i: sm.set_index("id").loc[i, "invoice_no"], key="rep_items_sel")
-            si = list_sales_items(int(sid))
-            st.dataframe(si, use_container_width=True)
-        else:
-            si = pd.DataFrame()
-
-        st.markdown("**Customer Balances (as of To date)**")
-        custs = load_customers()
-        rows = []
-        for _, r in custs.iterrows():
-            bal = get_customer_balance(int(r["id"]), as_of=dto.isoformat())
-            rows.append([r["id"], r["name"], r["phone"], r["email"], r["gstin"], r["city"], r["state"], r["pincode"], bal])
-        balances = pd.DataFrame(rows, columns=["CustomerID","Name","Phone","Email","GSTIN","City","State","Pincode","Balance"])
-        st.dataframe(balances, use_container_width=True)
-
-        # Downloads
-        stock = stock_df()
-        excel_bytes = export_reports_excel(dfp, sm, si, stock, balances)
-        st.download_button("Download reports.xlsx", data=excel_bytes, file_name="reports.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        st.download_button("Download purchases.csv", data=dfp.to_csv(index=False).encode("utf-8"), file_name="purchases.csv", mime="text/csv")
-        st.download_button("Download sales_master.csv", data=sm.to_csv(index=False).encode("utf-8"), file_name="sales_master.csv", mime="text/csv")
-        st.download_button("Download sales_items.csv", data=si.to_csv(index=False).encode("utf-8"), file_name="sales_items.csv", mime="text/csv")
-        st.download_button("Download customer_balances.csv", data=balances.to_csv(index=False).encode("utf-8"), file_name="customer_balances.csv", mime="text/csv")
-
-        st.divider()
-        st.subheader("Customer Statement PDF")
-        if not custs.empty:
-            cust_for_stmt = st.selectbox("Customer", options=custs["id"], format_func=lambda i: custs.set_index("id").loc[i, "name"])
-            opening = get_customer_balance(int(cust_for_stmt), as_of=dfrom.isoformat())
-            with get_conn() as conn:
-                ledger_df = pd.read_sql_query(
-                    "SELECT entry_date, entry_type, note, amount FROM ledger WHERE customer_id=? AND DATE(entry_date) >= DATE(?) AND DATE(entry_date) <= DATE(?) ORDER BY entry_date",
-                    conn, params=(int(cust_for_stmt), dfrom.isoformat(), dto.isoformat())
-                )
-            settings = load_settings()
-            if st.button("Download Statement PDF"):
-                cust_row = custs[custs["id"]==int(cust_for_stmt)].iloc[0].to_dict()
-                if not REPORTLAB_OK:
-                    st.error("ReportLab not installed. Add 'reportlab' to requirements.")
-                else:
-                    pdf = customer_statement_pdf(cust_row, ledger_df, opening, settings, dfrom.isoformat(), dto.isoformat())
-                    st.download_button("Save statement.pdf", data=pdf, file_name=f"statement_{cust_row.get('name','customer')}.pdf", mime="application/pdf")
-
-    # 8) Settings
-    with tabs[7]:
-        st.subheader("Company & Invoice Settings")
-        settings = load_settings()
-        with st.form("settings_form"):
-            c1, c2 = st.columns(2)
-            company_name = c1.text_input("Company Name", value=settings.get("company_name",""))
-            company_phone = c2.text_input("Phone", value=settings.get("company_phone",""))
-            company_email = c2.text_input("Email", value=settings.get("company_email",""))
-            company_gstin = c1.text_input("GSTIN", value=settings.get("company_gstin",""))
-            company_address = st.text_area("Address", value=settings.get("company_address",""))
-            invoice_footer = st.text_area("Invoice Footer (notes/terms)", value=settings.get("invoice_footer",""))
-            logo_file = st.file_uploader("Logo (PNG/JPG)", type=["png","jpg","jpeg"])
-            logo_bytes = settings.get("logo")
-            if logo_file is not None:
-                logo_bytes = logo_file.read()
-            if st.form_submit_button("Save Settings"):
-                save_settings({
-                    "company_name": company_name,
-                    "company_address": company_address,
-                    "company_phone": company_phone,
-                    "company_email": company_email,
-                    "company_gstin": company_gstin,
-                    "invoice_footer": invoice_footer,
-                    "logo": logo_bytes
-                })
-                st.success("Settings saved.")
-
-        st.subheader("Security")
-        with st.form("pwd_change"):
-            newpwd = st.text_input("New password", type="password")
-            newpwd2 = st.text_input("Confirm password", type="password")
-            if st.form_submit_button("Change Password"):
-                if not newpwd or newpwd != newpwd2:
-                    st.error("Passwords do not match")
-                else:
-                    change_password(st.session_state["user_id"], newpwd)
-                    st.success("Password updated.")
-
-        st.caption("SQLite DB: inventory.db")
-        try:
-            with open(DB_PATH, "rb") as f:
-                st.download_button("Download Database (inventory.db)", f, file_name="inventory.db")
-        except FileNotFoundError:
-            st.info("DB will be created on first write.")
+    # Render selected page
+    if page == "Dashboard":
+        ui_dashboard()
+    elif page == "Products":
+        ui_products()
+    elif page == "Customers":
+        ui_customers()
+    elif page == "Purchase":
+        ui_purchases()
+    elif page == "Sales":
+        ui_sales()
+    elif page == "Stock":
+        ui_stock()
+    elif page == "Reports":
+        ui_reports()
+    elif page == "Settings":
+        ui_settings()
 
 if __name__ == "__main__":
     main()
