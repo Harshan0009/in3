@@ -4,7 +4,9 @@ import sqlite3
 import pandas as pd
 from datetime import datetime, date
 from io import BytesIO
-import bcrypt
+
+# Password hashing (pure Python)
+from passlib.hash import bcrypt
 
 # Optional PDF libs
 try:
@@ -41,7 +43,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS users(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT UNIQUE NOT NULL,
-        password_hash BLOB NOT NULL,
+        password_hash TEXT NOT NULL,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );""")
 
@@ -55,10 +57,9 @@ def init_db():
         company_email TEXT,
         company_gstin TEXT,
         invoice_footer TEXT,
-        logo BLOB,       -- raw image bytes (PNG/JPG)
+        logo BLOB,
         updated_at TEXT DEFAULT CURRENT_TIMESTAMP
     );""")
-    # Ensure single row exists
     cur.execute("INSERT OR IGNORE INTO settings(id, company_name, company_address) VALUES(1, 'Your Company', 'Street, City, State, Pincode')")
 
     # Products
@@ -89,7 +90,7 @@ def init_db():
         notes TEXT
     );""")
 
-    # Customers (expanded)
+    # Customers (rich details)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS customers(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -108,12 +109,12 @@ def init_db():
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );""")
 
-    # Ledger
+    # Ledger (A/R)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS ledger(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
-        entry_type TEXT NOT NULL, -- 'sale' or 'payment' or 'adjustment'
+        entry_type TEXT NOT NULL, -- 'sale', 'payment', 'adjustment'
         ref_id INTEGER,           -- sale_master id if entry_type='sale'
         amount REAL NOT NULL,     -- debit positive (sale), credit negative (payment)
         entry_date TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -145,30 +146,29 @@ def init_db():
         line_total REAL DEFAULT 0
     );""")
 
-    # Default admin user (admin / admin123) - prompt to change
-    cur.execute("SELECT COUNT(*) FROM users")
+    # Default admin user
+    cur = conn.execute("SELECT COUNT(*) FROM users")
     if (cur.fetchone()[0] or 0) == 0:
-        pwd_hash = bcrypt.hashpw(b"admin123", bcrypt.gensalt())
-        cur.execute("INSERT INTO users(username, password_hash) VALUES(?,?)", ("admin", pwd_hash))
+        conn.execute("INSERT INTO users(username, password_hash) VALUES(?,?)", ("admin", bcrypt.hash("admin123")))
 
     conn.commit()
     conn.close()
 
-def verify_login(username: str, password: str) -> int | None:
+def verify_login(username, password):
     with get_conn() as conn:
         row = conn.execute("SELECT id, password_hash FROM users WHERE username=?", (username,)).fetchone()
-        if not row: return None
-        uid, pwh = row[0], row[1]
-        try:
-            ok = bcrypt.checkpw(password.encode('utf-8'), pwh)
-        except Exception:
-            ok = False
-        return int(uid) if ok else None
+    if not row:
+        return None
+    uid, stored_hash = row
+    try:
+        ok = bcrypt.verify(password, stored_hash)
+    except Exception:
+        ok = False
+    return int(uid) if ok else None
 
-def change_password(user_id: int, new_password: str):
+def change_password(user_id, new_password):
     with get_conn() as conn:
-        pwh = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt())
-        conn.execute("UPDATE users SET password_hash=? WHERE id=?", (pwh, user_id))
+        conn.execute("UPDATE users SET password_hash=? WHERE id=?", (bcrypt.hash(new_password), user_id))
         conn.commit()
 
 # ----------------------------
@@ -186,51 +186,54 @@ def load_customers():
 
 def load_settings():
     with get_conn() as conn:
-        row = conn.execute("SELECT company_name, company_address, company_phone, company_email, company_gstin, invoice_footer, logo FROM settings WHERE id=1").fetchone()
-        keys = ["company_name","company_address","company_phone","company_email","company_gstin","invoice_footer","logo"]
-        if row:
-            d = dict(zip(keys, row))
-        else:
-            d = {k:"" for k in keys}; d["logo"]=None
-        return d
+        row = conn.execute("""SELECT company_name, company_address, company_phone, company_email, company_gstin, invoice_footer, logo
+                              FROM settings WHERE id=1""").fetchone()
+    keys = ["company_name","company_address","company_phone","company_email","company_gstin","invoice_footer","logo"]
+    if row:
+        return dict(zip(keys, row))
+    return {k: (None if k=="logo" else "") for k in keys}
 
-def save_settings(data: dict):
+def save_settings(data):
     with get_conn() as conn:
-        conn.execute("""UPDATE settings SET company_name=?, company_address=?, company_phone=?, company_email=?, company_gstin=?, invoice_footer=?, logo=?, updated_at=CURRENT_TIMESTAMP WHERE id=1""",
-                     (data.get("company_name"), data.get("company_address"), data.get("company_phone"), data.get("company_email"),
-                      data.get("company_gstin"), data.get("invoice_footer"), data.get("logo")))
+        conn.execute("""UPDATE settings SET company_name=?, company_address=?, company_phone=?, company_email=?, company_gstin=?, invoice_footer=?, logo=?, updated_at=CURRENT_TIMESTAMP
+                        WHERE id=1""",
+                     (data.get("company_name"), data.get("company_address"), data.get("company_phone"),
+                      data.get("company_email"), data.get("company_gstin"), data.get("invoice_footer"),
+                      data.get("logo")))
         conn.commit()
 
 def get_or_create_customer(name, **fields):
     name = (name or "").strip()
-    if not name: return None
+    if not name: 
+        return None
     with get_conn() as conn:
-        cur = conn.execute("SELECT id FROM customers WHERE name=?", (name,))
-        row = cur.fetchone()
-        if row:
-            return int(row[0])
+        cur = conn.execute("SELECT id FROM customers WHERE name=?", (name,)).fetchone()
+        if cur:
+            return int(cur[0])
         cols = ["name","phone","email","gstin","pan","address","city","state","pincode","credit_limit","opening_balance","notes"]
         vals = [name] + [fields.get(c) for c in cols[1:]]
         conn.execute(f"INSERT INTO customers({','.join(cols)}) VALUES({','.join(['?']*len(cols))})", vals)
         conn.commit()
-        cur = conn.execute("SELECT id FROM customers WHERE name=?", (name,))
-        return int(cur.fetchone()[0])
+        cur = conn.execute("SELECT id FROM customers WHERE name=?", (name,)).fetchone()
+        return int(cur[0])
 
-def get_customer_balance(customer_id: int, as_of: str | None = None) -> float:
+def get_customer_balance(customer_id, as_of=None):
     with get_conn() as conn:
-        ob = conn.execute("SELECT COALESCE(opening_balance,0) FROM customers WHERE id=?", (customer_id,)).fetchone()
-        ob = float(ob[0]) if ob else 0.0
+        ob_row = conn.execute("SELECT COALESCE(opening_balance,0) FROM customers WHERE id=?", (customer_id,)).fetchone()
+        ob = float(ob_row[0]) if ob_row else 0.0
         if as_of:
-            lg = conn.execute("SELECT COALESCE(SUM(amount),0) FROM ledger WHERE customer_id=? AND DATE(entry_date) <= DATE(?)", (customer_id, as_of)).fetchone()[0]
+            lg = conn.execute("SELECT COALESCE(SUM(amount),0) FROM ledger WHERE customer_id=? AND DATE(entry_date) <= DATE(?)",
+                              (customer_id, as_of)).fetchone()[0]
         else:
-            lg = conn.execute("SELECT COALESCE(SUM(amount),0) FROM ledger WHERE customer_id=?", (customer_id,)).fetchone()[0]
+            lg = conn.execute("SELECT COALESCE(SUM(amount),0) FROM ledger WHERE customer_id=?",
+                              (customer_id,)).fetchone()[0]
         return round(ob + float(lg or 0), 2)
 
-def get_stock(product_id: int) -> float:
+def get_stock(product_id):
     with get_conn() as conn:
         p = conn.execute("SELECT COALESCE(SUM(qty),0) FROM purchases WHERE product_id=?", (product_id,)).fetchone()[0]
-        s2 = conn.execute("SELECT COALESCE(SUM(qty),0) FROM sale_items WHERE product_id=?", (product_id,)).fetchone()[0]
-        return (p or 0) - (s2 or 0)
+        s = conn.execute("SELECT COALESCE(SUM(qty),0) FROM sale_items WHERE product_id=?", (product_id,)).fetchone()[0]
+    return (p or 0) - (s or 0)
 
 def stock_df():
     prods = load_products()
@@ -273,13 +276,13 @@ def add_purchase(product_id, qty, cp, bill_no, supplier, when, notes):
 
 def next_invoice_no():
     with get_conn() as conn:
-        cur = conn.execute("SELECT COUNT(*) FROM sale_master")
-        count = (cur.fetchone() or [0])[0] + 1
+        cur = conn.execute("SELECT COUNT(*) FROM sale_master").fetchone()[0]
     now = datetime.now().strftime("%Y%m")
-    return f"INV-{now}-{count:04d}"
+    return f"INV-{now}-{int(cur)+1:04d}"
 
 def add_sale_multi(customer_id, sold_at, items, invoice_no, notes, payment_received):
     with get_conn() as conn:
+        # compute and validate
         subtotal = 0.0; tax_total = 0.0; total_amount = 0.0
         for it in items:
             qty = float(it["qty"]); price = float(it["unit_price"]); gst = float(it["gst_rate"])
@@ -292,11 +295,13 @@ def add_sale_multi(customer_id, sold_at, items, invoice_no, notes, payment_recei
             line_total = round(line_sub + line_tax, 2)
             subtotal += line_sub; tax_total += line_tax; total_amount += line_total
 
-        cur = conn.execute("""INSERT INTO sale_master(invoice_no, customer_id, sold_at, subtotal, tax_amount, total_amount, notes)
-                              VALUES(?,?,?,?,?,?,?)""",
-                           (invoice_no, customer_id, sold_at, round(subtotal,2), round(tax_total,2), round(total_amount,2), notes))
+        # header
+        conn.execute("""INSERT INTO sale_master(invoice_no, customer_id, sold_at, subtotal, tax_amount, total_amount, notes)
+                        VALUES(?,?,?,?,?,?,?)""",
+                     (invoice_no, customer_id, sold_at, round(subtotal,2), round(tax_total,2), round(total_amount,2), notes))
         sale_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
+        # lines
         for it in items:
             qty = float(it["qty"]); price = float(it["unit_price"]); gst = float(it["gst_rate"])
             line_sub = qty * price
@@ -307,7 +312,7 @@ def add_sale_multi(customer_id, sold_at, items, invoice_no, notes, payment_recei
                             VALUES(?,?,?,?,?,?,?,?)""",
                          (sale_id, int(it["product_id"]), desc, qty, price, gst, line_tax, line_total))
 
-        # Ledger entries
+        # ledger
         conn.execute("""INSERT INTO ledger(customer_id, entry_type, ref_id, amount, entry_date, note)
                         VALUES(?,?,?,?,?,?)""",
                      (customer_id, "sale", sale_id, round(total_amount,2), sold_at, f"Invoice {invoice_no}"))
@@ -316,7 +321,6 @@ def add_sale_multi(customer_id, sold_at, items, invoice_no, notes, payment_recei
             conn.execute("""INSERT INTO ledger(customer_id, entry_type, ref_id, amount, entry_date, note)
                             VALUES(?,?,?,?,?,?)""",
                          (customer_id, "payment", sale_id, amt, sold_at, f"Against {invoice_no}"))
-
         conn.commit()
         return int(sale_id), round(subtotal,2), round(tax_total,2), round(total_amount,2)
 
@@ -382,6 +386,7 @@ def make_invoice_pdf_multi(sale_row, items_df, settings):
 
     # Logo if present
     logo_bytes = settings.get("logo")
+    x_text = x
     if logo_bytes:
         try:
             img = ImageReader(BytesIO(logo_bytes))
@@ -389,8 +394,6 @@ def make_invoice_pdf_multi(sale_row, items_df, settings):
             x_text = x + 30*mm
         except Exception:
             x_text = x
-    else:
-        x_text = x
 
     c.setFont("Helvetica-Bold", 16); c.drawString(x_text, y, settings.get("company_name","Your Company"))
     c.setFont("Helvetica", 10); y -= 12; c.drawString(x_text, y, settings.get("company_address",""))
@@ -414,7 +417,7 @@ def make_invoice_pdf_multi(sale_row, items_df, settings):
 
     c.setFont("Helvetica", 10)
     for _, r in items_df.iterrows():
-        if y < 60*mm:  # new page if low space
+        if y < 60*mm:  # new page
             c.showPage(); y = H - 20*mm
             c.setFont("Helvetica-Bold", 10)
             c.drawString(x, y, "Item"); c.drawRightString(W-130, y, "Qty"); c.drawRightString(W-100, y, "Rate"); c.drawRightString(W-70, y, "GST%"); c.drawRightString(W-30, y, "Amount")
@@ -450,6 +453,7 @@ def customer_statement_pdf(customer_row, ledger_df, opening_balance, settings, d
 
     # Header with logo
     logo_bytes = settings.get("logo")
+    x_text = x
     if logo_bytes:
         try:
             img = ImageReader(BytesIO(logo_bytes))
@@ -457,8 +461,6 @@ def customer_statement_pdf(customer_row, ledger_df, opening_balance, settings, d
             x_text = x + 30*mm
         except Exception:
             x_text = x
-    else:
-        x_text = x
 
     c.setFont("Helvetica-Bold", 16); c.drawString(x_text, y, settings.get("company_name","Your Company"))
     c.setFont("Helvetica", 10); y -= 12; c.drawString(x_text, y, settings.get("company_address",""))
@@ -525,7 +527,7 @@ def export_reports_excel(dfp, sales_master, sales_items, stock, balances):
 # ----------------------------
 def login_gate():
     st.title("🔒 Login")
-    st.caption("Default admin: **admin / admin123** (please change after login in Settings).")
+    st.caption("Default admin: **admin / admin123** (change it in Settings).")
     u = st.text_input("Username")
     p = st.text_input("Password", type="password")
     if st.button("Sign in"):
@@ -541,7 +543,7 @@ def login_gate():
 # UI
 # ----------------------------
 def main():
-    st.set_page_config(page_title="Inventory (Login + Custom Invoice)", page_icon="📦", layout="wide")
+    st.set_page_config(page_title="Inventory (Login + Multi-item + PDFs)", page_icon="📦", layout="wide")
     init_db()
 
     # auth
@@ -701,7 +703,7 @@ def main():
             cust_name = csel2.text_input("New Customer Name")
             cust_id = None
 
-        # Show last balance
+        # Balance
         last_balance = 0.0
         if mode == "Select existing" and custs is not None and not custs.empty:
             last_balance = get_customer_balance(int(cust_id))
@@ -754,7 +756,7 @@ def main():
         notes = st.text_input("Notes")
         paid_now = st.number_input("Amount received now (optional)", min_value=0.0, step=1.0, value=0.0)
 
-        colA, colB, colC = st.columns(3)
+        colA, colB = st.columns(2)
         if colA.button("Save Invoice"):
             if mode == "Type new":
                 if not cust_name.strip():
@@ -903,7 +905,7 @@ def main():
                     change_password(st.session_state["user_id"], newpwd)
                     st.success("Password updated.")
 
-        st.caption("SQLite DB: inventory.db (download from here)")
+        st.caption("SQLite DB: inventory.db")
         try:
             with open(DB_PATH, "rb") as f:
                 st.download_button("Download Database (inventory.db)", f, file_name="inventory.db")
