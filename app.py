@@ -29,6 +29,10 @@ def column_exists(conn, table, column):
     cur = conn.execute(f"PRAGMA table_info({table})")
     return any(r[1] == column for r in cur.fetchall())
 
+def table_exists(conn, table):
+    cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
+    return cur.fetchone() is not None
+
 def init_db():
     """Create base tables and apply idempotent migrations safely."""
     conn = get_conn()
@@ -69,6 +73,28 @@ def init_db():
         notes TEXT
     );""")
 
+    # Customers & ledger
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS customers(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        phone TEXT,
+        address TEXT,
+        opening_balance REAL DEFAULT 0,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );""")
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS ledger(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+        entry_type TEXT NOT NULL, -- 'sale' or 'payment' or 'adjustment'
+        ref_id INTEGER,           -- sale id if entry_type='sale'
+        amount REAL NOT NULL,     -- debit positive (sale), credit negative (payment)
+        entry_date TEXT DEFAULT CURRENT_TIMESTAMP,
+        note TEXT
+    );""")
+
     # --- Schema upgrades (safe & idempotent) ---
     if not column_exists(conn, "products", "barcode"):
         conn.execute("ALTER TABLE products ADD COLUMN barcode TEXT")
@@ -83,6 +109,8 @@ def init_db():
         conn.execute("ALTER TABLE sales ADD COLUMN tax_amount REAL DEFAULT 0")
     if not column_exists(conn, "sales", "total_amount"):
         conn.execute("ALTER TABLE sales ADD COLUMN total_amount REAL DEFAULT 0")
+    if not column_exists(conn, "sales", "customer_id"):
+        conn.execute("ALTER TABLE sales ADD COLUMN customer_id INTEGER REFERENCES customers(id)")
 
     # Unique index on barcode (allows multiple NULLs, unique when not NULL)
     conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_products_barcode
@@ -98,6 +126,33 @@ def init_db():
 def load_products():
     with get_conn() as conn:
         return pd.read_sql_query("SELECT * FROM products ORDER BY name", conn)
+
+@st.cache_data(ttl=60)
+def load_customers():
+    with get_conn() as conn:
+        return pd.read_sql_query("SELECT * FROM customers ORDER BY name", conn)
+
+def get_or_create_customer(name, phone="", address=""):
+    name = (name or "").strip()
+    if not name:
+        return None
+    with get_conn() as conn:
+        cur = conn.execute("SELECT id FROM customers WHERE name=?", (name,))
+        row = cur.fetchone()
+        if row:
+            return int(row[0])
+        conn.execute("INSERT INTO customers(name, phone, address) VALUES(?,?,?)", (name, phone, address))
+        conn.commit()
+        cur = conn.execute("SELECT id FROM customers WHERE name=?", (name,))
+        return int(cur.fetchone()[0])
+
+def get_customer_balance(customer_id: int) -> float:
+    """Opening balance + sum(ledger.amount). Sales are positive (debit), payments negative (credit)."""
+    with get_conn() as conn:
+        ob = conn.execute("SELECT COALESCE(opening_balance,0) FROM customers WHERE id=?", (customer_id,)).fetchone()
+        ob = float(ob[0]) if ob else 0.0
+        lg = conn.execute("SELECT COALESCE(SUM(amount),0) FROM ledger WHERE customer_id=?", (customer_id,)).fetchone()[0]
+        return round(ob + float(lg or 0), 2)
 
 def get_stock(product_id: int) -> float:
     with get_conn() as conn:
@@ -147,15 +202,32 @@ def add_purchase(product_id, qty, cp, bill_no, supplier, when, notes):
                      (product_id, float(qty), float(cp or 0), bill_no, supplier, when, notes))
         conn.commit()
 
-def add_sale(product_id, qty, sp, gst_rate, invoice_no, customer, when, notes):
+def add_sale(product_id, qty, sp, gst_rate, invoice_no, customer_id, customer_name, when, notes):
     sp = float(sp or 0); qty = float(qty or 0); gst_rate = float(gst_rate or 0)
     subtotal = sp * qty
     tax_amount = round(subtotal * gst_rate / 100.0, 2)
     total_amount = round(subtotal + tax_amount, 2)
     with get_conn() as conn:
-        conn.execute("""INSERT INTO sales(product_id, qty, selling_price, gst_rate, tax_amount, total_amount, invoice_no, customer, sold_at, notes)
-                        VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                     (product_id, qty, sp, gst_rate, tax_amount, total_amount, invoice_no, customer, when, notes))
+        # Write sale
+        conn.execute("""INSERT INTO sales(product_id, qty, selling_price, gst_rate, tax_amount, total_amount,
+                                          invoice_no, customer, customer_id, sold_at, notes)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                     (product_id, qty, sp, gst_rate, tax_amount, total_amount,
+                      invoice_no, customer_name, customer_id, when, notes))
+        sale_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        # Ledger debit (increase receivable)
+        conn.execute("""INSERT INTO ledger(customer_id, entry_type, ref_id, amount, entry_date, note)
+                        VALUES(?,?,?,?,?,?)""",
+                     (customer_id, "sale", sale_id, total_amount, when, f"Invoice {invoice_no}"))
+        conn.commit()
+    return total_amount
+
+def add_payment(customer_id, amount, when, note):
+    amt = -abs(float(amount or 0))  # credit reduces balance
+    with get_conn() as conn:
+        conn.execute("""INSERT INTO ledger(customer_id, entry_type, ref_id, amount, entry_date, note)
+                        VALUES(?,?,?,?,?,?)""",
+                     (customer_id, "payment", None, amt, when, note))
         conn.commit()
 
 def list_purchases(date_from=None, date_to=None):
@@ -173,8 +245,10 @@ def list_purchases(date_from=None, date_to=None):
 
 def list_sales(date_from=None, date_to=None):
     query = """SELECT s.id, pr.name as product, s.qty, s.selling_price, s.gst_rate, s.tax_amount, s.total_amount,
-                      s.invoice_no, s.customer, s.sold_at, s.notes
-               FROM sales s JOIN products pr ON pr.id=s.product_id"""
+                      s.invoice_no, COALESCE(c.name, s.customer) as customer, s.sold_at, s.notes
+               FROM sales s
+               JOIN products pr ON pr.id=s.product_id
+               LEFT JOIN customers c ON c.id=s.customer_id"""
     filters, params = [], []
     if date_from:
         filters.append("DATE(s.sold_at) >= DATE(?)"); params.append(date_from)
@@ -195,6 +269,7 @@ def simple_kpis():
 
 def reset_cache():
     load_products.clear()
+    load_customers.clear()
 
 def next_invoice_no():
     with get_conn() as conn:
@@ -267,10 +342,10 @@ def export_reports_to_excel(dfp, dfs):
 # UI
 # ----------------------------
 def main():
-    st.set_page_config(page_title="Simple Inventory (GST + PDF + Excel)", page_icon="📦", layout="wide")
+    st.set_page_config(page_title="Simple Inventory (Customers + Balances)", page_icon="📦", layout="wide")
     init_db()
     st.title("📦 Simple Inventory App")
-    st.caption("GST on sales, PDF invoices, Excel exports.")
+    st.caption("Customers, balances (A/R), GST, PDF invoices, Excel exports.")
 
     tabs = st.tabs(["1) Dashboard", "2) Products", "3) Purchase", "4) Sales", "5) Stock", "6) Reports", "7) Settings"])
 
@@ -361,12 +436,28 @@ def main():
         dfp = list_purchases()
         st.dataframe(dfp, use_container_width=True)
 
-    # 4) Sales
+    # 4) Sales (Customers & Balances)
     with tabs[3]:
-        st.subheader("Record Sale (with GST)")
+        st.subheader("Record Sale (with GST & Customer Balance)")
         prods = load_products()
+        customers = load_customers()
+        csel1, csel2 = st.columns(2)
+        customer_mode = csel1.radio("Customer input mode", ["Select existing","Type new"], horizontal=True)
+        if customer_mode == "Select existing" and not customers.empty:
+            cust_id = csel1.selectbox("Customer", options=customers["id"], format_func=lambda i: customers.set_index("id").loc[i, "name"])
+            cust_name = customers.set_index("id").loc[cust_id, "name"]
+        else:
+            cust_name = csel2.text_input("New Customer Name")
+            cust_id = None  # will be created later
+
+        # Show last balance
+        last_balance = 0.0
+        if customer_mode == "Select existing" and customers is not None and not customers.empty:
+            last_balance = get_customer_balance(int(cust_id))
+        st.info(f"Customer last balance: ₹ {last_balance:,.2f} (positive means customer owes you)")
+
         if prods.empty:
-            st.info("Add a product first.")
+            st.info("Add a product first in the Products tab.")
         else:
             c1, c2 = st.columns(2)
             prod = c1.selectbox("Product", options=prods["id"], format_func=lambda i: prods.set_index("id").loc[i, "name"], key="sale_prod")
@@ -382,7 +473,7 @@ def main():
             c3, c4, c5 = st.columns(3)
             sp = c3.number_input("Selling price per unit (pre-tax)", min_value=0.0, step=1.0, value=default_sp, key="sale_sp")
             gst = c4.number_input("GST %", min_value=0.0, step=1.0, value=default_gst, key="sale_gst")
-            cust = c5.text_input("Customer", key="sale_cust")
+            invoice_no = c5.text_input("Invoice No.", value=next_invoice_no())
 
             c6, c7 = st.columns(2)
             when = c6.date_input("Sold on", value=date.today(), key="sale_date")
@@ -393,17 +484,49 @@ def main():
             total_amount = round(subtotal + tax_amount, 2)
             st.info(f"Subtotal ₹{subtotal:.2f}  |  GST ₹{tax_amount:.2f}  |  Total ₹{total_amount:.2f}")
 
-            inv_col1, inv_col2 = st.columns(2)
-            invoice_no = inv_col1.text_input("Invoice No.", value=next_invoice_no())
+            # Amount paid now (optional) -> will add a payment entry
+            paid_now = st.number_input("Amount received now (optional)", min_value=0.0, step=1.0, value=0.0)
             if st.button("Add Sale"):
+                # customer ensure
+                if customer_mode == "Type new":
+                    if not cust_name.strip():
+                        st.error("Please enter a customer name or select existing.")
+                        st.stop()
+                    cust_id_real = get_or_create_customer(cust_name.strip())
+                else:
+                    cust_id_real = int(cust_id)
                 current = get_stock(int(prod))
                 if qty <= 0:
                     st.error("Quantity must be > 0")
                 elif qty > current:
                     st.warning(f"Not enough stock. Available: {current:.2f}")
                 else:
-                    add_sale(int(prod), qty, sp, gst, invoice_no, cust, when.isoformat(), notes)
-                    st.success("Sale recorded. Stock decreased."); reset_cache()
+                    total_bill = add_sale(int(prod), qty, sp, gst, invoice_no, cust_id_real, cust_name.strip() or cust_name, when.isoformat(), notes)
+                    if paid_now and paid_now > 0:
+                        add_payment(cust_id_real, paid_now, when.isoformat(), f"Against {invoice_no}")
+                    st.success(f"Sale recorded. Net ₹{total_bill:.2f}. Stock decreased.")
+                    reset_cache()
+
+        st.divider()
+        st.subheader("Record Payment (reduce balance)")
+        customers = load_customers()
+        if customers.empty:
+            st.info("Add or create a customer first.")
+        else:
+            p1, p2, p3 = st.columns(3)
+            cust_for_payment = p1.selectbox("Customer", options=customers["id"], format_func=lambda i: customers.set_index("id").loc[i, "name"], key="pay_cust")
+            bal = get_customer_balance(int(cust_for_payment))
+            p1.metric("Current Balance", f"₹ {bal:,.2f}")
+            amt = p2.number_input("Amount received", min_value=0.0, step=1.0, key="pay_amt")
+            when_pay = p3.date_input("Payment date", value=date.today(), key="pay_date")
+            note = st.text_input("Note (optional)", key="pay_note")
+            if st.button("Add Payment"):
+                if amt <= 0:
+                    st.error("Enter amount > 0")
+                else:
+                    add_payment(int(cust_for_payment), amt, when_pay.isoformat(), note)
+                    st.success("Payment recorded. Balance reduced.")
+                    reset_cache()
 
         st.divider()
         st.subheader("Recent Sales")
@@ -413,7 +536,7 @@ def main():
         st.markdown("### Generate PDF Invoice")
         if not dfs.empty:
             sale_ids = dfs["id"].tolist()
-            sel_sale = st.selectbox("Select a sale", options=sale_ids, format_func=lambda i: f"{int(i)} — {dfs.set_index('id').loc[i, 'invoice_no']}")
+            sel_sale = st.selectbox("Select a sale", options=sale_ids, format_func=lambda i: f\"{int(i)} — {dfs.set_index('id').loc[i, 'invoice_no']}\" )
             company_name = st.text_input("Company Name", value="Your Company")
             company_address = st.text_area("Address", value="Street, City, State, Pincode")
             company_phone = st.text_input("Phone", value="")
@@ -484,6 +607,8 @@ def main():
                     conn.execute("DELETE FROM purchases")
                     conn.execute("DELETE FROM sales")
                     conn.execute("DELETE FROM products")
+                    conn.execute("DELETE FROM ledger")
+                    conn.execute("DELETE FROM customers")
                     conn.commit()
                 reset_cache()
                 st.success("All data erased.")
