@@ -6,7 +6,7 @@ from datetime import datetime, date
 from io import BytesIO
 
 # Password hashing (pure Python)
-from passlib.hash import bcrypt
+import hashlib
 
 # Optional PDF libs
 try:
@@ -46,6 +46,20 @@ def init_db():
         password_hash TEXT NOT NULL,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );""")
+
+    # Create default admin user if not exists
+    cur = conn.execute("SELECT COUNT(*) FROM users")
+    if (cur.fetchone()[0] or 0) == 0:
+        import hashlib
+        default_password = hashlib.sha256("admin123".encode()).hexdigest()
+        conn.execute(
+            "INSERT INTO users(username, password_hash) VALUES(?,?)",
+            ("admin", default_password)
+        )
+
+    conn.commit()
+    conn.close()
+
 
     # App settings (invoice/company)
     cur.execute("""
@@ -155,20 +169,19 @@ def init_db():
     conn.close()
 
 def verify_login(username, password):
+    import hashlib
     with get_conn() as conn:
         row = conn.execute("SELECT id, password_hash FROM users WHERE username=?", (username,)).fetchone()
     if not row:
         return None
     uid, stored_hash = row
-    try:
-        ok = bcrypt.verify(password, stored_hash)
-    except Exception:
-        ok = False
-    return int(uid) if ok else None
+    hashed = hashlib.sha256(password.encode()).hexdigest()
+    return int(uid) if hashed == stored_hash else None
 
 def change_password(user_id, new_password):
+    hashed = hashlib.sha256(new_password.encode()).hexdigest()
     with get_conn() as conn:
-        conn.execute("UPDATE users SET password_hash=? WHERE id=?", (bcrypt.hash(new_password), user_id))
+        conn.execute("UPDATE users SET password_hash=? WHERE id=?", (hashed, user_id))
         conn.commit()
 
 # ----------------------------
