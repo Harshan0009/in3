@@ -630,8 +630,8 @@ with tabs[4]:
 # Reports
 with tabs[5]:
     st.subheader("Simple Reports & Export")
+    col1, col2 = st.columns(2)
 
-        col1, col2 = st.columns(2)
         dfrom = col1.date_input("From", value=date.today().replace(day=1))
         dto = col2.date_input("To", value=date.today())
         st.write("**Purchases**")
