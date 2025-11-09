@@ -1,32 +1,33 @@
 
-# Simple Inventory App (Streamlit) — Enhanced
-Seven tabs: Dashboard, Products, Purchase, Sales, Stock, Reports, Settings.
+# Enhanced Inventory App
 
-New:
-- Barcode & Low Stock Threshold per product
-- Low-stock alerts and filter on Dashboard
-- Import/Export products CSV
+Single-file Streamlit app (app.py) — enhanced features:
+- Multi-line invoices (invoices + invoice_items)
+- Customers table
+- Cart-based invoice creation and PDF invoice (ReportLab)
+- Backup & restore (upload .db)
+- Product duplicate handling (no silent INSERT OR IGNORE)
+- Password-protected admin with password change UI
 
-## Run
-1) Install Python 3.10+
-2) `pip install -r requirements.txt`
-3) `streamlit run app.py`
+## Setup
+1. Create a virtual environment (recommended):
+   ```bash
+   python -m venv venv
+   source venv/bin/activate  # or venv\\Scripts\\activate on Windows
+   pip install streamlit pandas reportlab xlsxwriter
+   ```
+   *Note:* `reportlab` is optional — without it you won't be able to create PDFs.
 
-SQLite DB file `inventory.db` will be created next to app.py on first run.
+2. Save `app.py` in a folder and run:
+   ```bash
+   streamlit run app.py
+   ```
 
+3. First login password is: `admin123`. Change it immediately under **Settings > Admin > Change Admin Password**.
 
-## GST, PDF, and Excel
-- Add products with GST% (tax_rate). Sales show tax breakup and store gst_rate, tax_amount, total_amount.
-- Generate a PDF invoice per sale (uses ReportLab). If you see an error, install dependencies with `pip install -r requirements.txt`.
-- Export Purchases and Sales to a single Excel with two sheets.
+## Notes & Tips
+- Invoices are created with a generated invoice number. If you want stricter uniqueness under concurrent usage, consider migrating DB to Postgres.
+- The app stores the admin password hash in the `settings` table. Passwords are hashed with SHA256 + salt. For stronger security use a proper hashing library (bcrypt) when deploying.
+- CSV / Excel exports are provided in Reports and Stock tabs.
 
-
-## Troubleshooting (uv / Streamlit Cloud)
-- If install hangs on `pandas==2.2.2`, upgrade to `pandas>=2.2.3` (already set here).
-- If the app still doesn't boot, try Python 3.12 by changing `runtime.txt` to `python-3.12`.
-- Local run: `uv pip install -r requirements.txt && streamlit run app.py`.
-
-
-### Note on barcode UNIQUE
-SQLite doesn't allow `ALTER TABLE ... ADD COLUMN ... UNIQUE`. This app creates a UNIQUE INDEX instead:
-`CREATE UNIQUE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode) WHERE barcode IS NOT NULL`.
+Enjoy — ask me to tweak any behavior or split files into modules.
