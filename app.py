@@ -393,7 +393,7 @@ def verify_login():
         h = get_setting('admin_password_hash')
         if check_password_hash(pw, h):
             st.session_state.logged_in = True
-            st.experimental_rerun()
+            st.rerun()
         else:
             st.sidebar.error("Incorrect password")
     return False
