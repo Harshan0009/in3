@@ -1,4 +1,3 @@
-
 # app.py
 import streamlit as st
 import sqlite3
@@ -447,7 +446,8 @@ def main():
         st.subheader("Quick Stock Snapshot")
         df = stock_df()
         only_low = st.checkbox("Show only Low-stock items", value=False)
-        if only_low: df = df[df["Low?"]=="YES"]
+        if only_low:
+            df = df[df["Low?"]=="YES"]
         st.dataframe(df.drop(columns=['id'], errors='ignore'), use_container_width=True)
 
     # Products
@@ -619,19 +619,18 @@ def main():
                         pdf_bytes = make_invoice_pdf_multi(inv_row, items, {"name":company_name, "address":company_address, "phone":company_phone, "gstin":company_gstin})
                         st.download_button("Download Invoice PDF", data=pdf_bytes, file_name=f"{inv_row.get('invoice_no','invoice')}.pdf", mime="application/pdf")
 
-# Stock
-with tabs[4]:
-    st.subheader("Current Stock")
-    s = stock_df()
-    st.dataframe(s.drop(columns=['id'], errors='ignore'), use_container_width=True)
-    csv = s.drop(columns=['id'], errors='ignore').to_csv(index=False).encode("utf-8")
-    st.download_button("Download Stock CSV", data=csv, file_name="stock.csv", mime="text/csv")
+    # Stock
+    with tabs[4]:
+        st.subheader("Current Stock")
+        s = stock_df()
+        st.dataframe(s.drop(columns=['id'], errors='ignore'), use_container_width=True)
+        csv = s.drop(columns=['id'], errors='ignore').to_csv(index=False).encode("utf-8")
+        st.download_button("Download Stock CSV", data=csv, file_name="stock.csv", mime="text/csv")
 
-# Reports
-with tabs[5]:
-    st.subheader("Simple Reports & Export")
-    col1, col2 = st.columns(2)
-
+    # Reports
+    with tabs[5]:
+        st.subheader("Simple Reports & Export")
+        col1, col2 = st.columns(2)
         dfrom = col1.date_input("From", value=date.today().replace(day=1))
         dto = col2.date_input("To", value=date.today())
         st.write("**Purchases**")
