@@ -448,7 +448,7 @@ def main():
         df = stock_df()
         only_low = st.checkbox("Show only Low-stock items", value=False)
         if only_low: df = df[df["Low?"]=="YES"]
-        st.dataframe(df.drop(columns=['id']), use_container_width=True)
+        st.dataframe(df.drop(columns=['id'], errors='ignore'), use_container_width=True)
 
     # Products
     with tabs[1]:
@@ -623,8 +623,8 @@ def main():
     with tabs[4]:
         st.subheader("Current Stock")
         s = stock_df()
-        st.dataframe(s.drop(columns=['id']), use_container_width=True)
-        csv = s.drop(columns=['id']).to_csv(index=False).encode("utf-8")
+        st.dataframe(s.drop(columns=['id'], errors='ignore'), use_container_width=True)
+csv = s.drop(columns=['id'], errors='ignore').to_csv(index=False).encode("utf-8")
         st.download_button("Download Stock CSV", data=csv, file_name="stock.csv", mime="text/csv")
 
     # Reports
