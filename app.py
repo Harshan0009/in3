@@ -625,7 +625,7 @@ def main():
         s = stock_df()
         st.dataframe(s.drop(columns=['id'], errors='ignore'), use_container_width=True)
 csv = s.drop(columns=['id'], errors='ignore').to_csv(index=False).encode("utf-8")
-        st.download_button("Download Stock CSV", data=csv, file_name="stock.csv", mime="text/csv")
+st.download_button("Download Stock CSV", data=csv, file_name="stock.csv", mime="text/csv")
 
     # Reports
     with tabs[5]:
