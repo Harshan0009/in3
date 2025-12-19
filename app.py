@@ -1,9 +1,3 @@
-# app_production_fixed.py
-# ============================================================
-# REAL-WORLD SAFE INVENTORY & GST BILLING SYSTEM (EDITABLE)
-# STARTUP-ERROR FIXED VERSION
-# ============================================================
-
 import streamlit as st
 import sqlite3
 import pandas as pd
@@ -55,12 +49,6 @@ def init_db():
     )""")
 
     c.execute("""
-    CREATE TABLE IF NOT EXISTS customers(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL
-    )""")
-
-    c.execute("""
     CREATE TABLE IF NOT EXISTS invoice_sequence(
         ym TEXT PRIMARY KEY,
         last_no INTEGER
@@ -70,7 +58,6 @@ def init_db():
     CREATE TABLE IF NOT EXISTS invoices(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         invoice_no TEXT UNIQUE,
-        customer_id INTEGER,
         date TEXT,
         subtotal REAL,
         tax REAL,
@@ -137,14 +124,14 @@ def next_invoice_no():
 
 # ---------------- INVOICE ----------------
 
-def create_invoice(items, supply_type):
+def create_invoice(cart, supply_type):
     conn = get_conn()
     cur = conn.cursor()
 
     subtotal = tax = 0.0
     rows = []
 
-    for it in items:
+    for it in cart:
         base = it['qty'] * it['price']
         t = base * it['gst'] / 100
         subtotal += base
@@ -188,6 +175,7 @@ def login():
         h = get_conn().execute("SELECT v FROM settings WHERE k='admin'").fetchone()[0]
         if check_password(pw, h):
             st.session_state.logged_in = True
+            st.session_state.cart = []
             st.rerun()
         else:
             st.sidebar.error("Incorrect password")
@@ -196,11 +184,14 @@ def login():
 # ---------------- UI ----------------
 
 def main():
-    st.set_page_config("Inventory GST (Stable)", "📦", layout="wide")
+    st.set_page_config("Inventory GST (Persistent Cart)", "📦", layout="wide")
     init_db()
 
     if not login():
         st.stop()
+
+    if 'cart' not in st.session_state:
+        st.session_state.cart = []
 
     menu = st.sidebar.radio("Menu", ["Dashboard", "Products", "Purchase", "Sales", "Reports"])
 
@@ -247,17 +238,29 @@ def main():
         if df.empty:
             st.info("Add products first")
         else:
-            cart = []
             pid = st.selectbox("Product", df['id'], format_func=lambda i: df.set_index('id').loc[i,'name'])
             qty = st.number_input("Qty", min_value=1.0)
             if st.button("Add to cart"):
                 r = df.set_index('id').loc[pid]
-                cart.append({'pid': pid, 'qty': qty, 'price': r['selling_price'], 'gst': r['gst_rate']})
-                st.success("Added to cart (single-item demo)")
-            supply = st.selectbox("Supply type", ['INTRA','INTER'])
-            if st.button("Create invoice"):
-                inv = create_invoice(cart, supply)
-                st.success(f"Invoice {inv} created")
+                st.session_state.cart.append({
+                    'pid': pid,
+                    'name': r['name'],
+                    'qty': qty,
+                    'price': r['selling_price'],
+                    'gst': r['gst_rate']
+                })
+                st.success("Added to cart")
+
+            if st.session_state.cart:
+                cart_df = pd.DataFrame(st.session_state.cart)
+                st.subheader("Cart")
+                st.dataframe(cart_df, use_container_width=True)
+
+                supply = st.selectbox("Supply type", ['INTRA','INTER'])
+                if st.button("Create invoice"):
+                    inv = create_invoice(st.session_state.cart, supply)
+                    st.success(f"Invoice {inv} created")
+                    st.session_state.cart = []
 
     elif menu == "Reports":
         st.header("GST Summary")
