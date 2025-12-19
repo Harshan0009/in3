@@ -1,3 +1,9 @@
+# app_production_cart.py
+# ============================================================
+# REAL-WORLD SAFE INVENTORY & GST BILLING SYSTEM
+# WITH PERSISTENT CART (STREAMLIT-SAFE)
+# ============================================================
+
 import streamlit as st
 import sqlite3
 import pandas as pd
@@ -169,16 +175,33 @@ def login():
     if st.session_state.get('logged_in'):
         return True
 
-    st.sidebar.title("Login")
-    pw = st.sidebar.text_input("Password", type="password")
-    if st.sidebar.button("Login"):
+    st.markdown("""
+        <style>
+        .login-box {
+            max-width: 380px;
+            margin: 120px auto;
+            padding: 30px;
+            border-radius: 12px;
+            background-color: rgba(255,255,255,0.03);
+            box-shadow: 0 0 20px rgba(0,0,0,0.4);
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown('<div class="login-box">', unsafe_allow_html=True)
+    st.title("Login")
+
+    pw = st.text_input("Password", type="password")
+    if st.button("Login", use_container_width=True):
         h = get_conn().execute("SELECT v FROM settings WHERE k='admin'").fetchone()[0]
         if check_password(pw, h):
             st.session_state.logged_in = True
             st.session_state.cart = []
             st.rerun()
         else:
-            st.sidebar.error("Incorrect password")
+            st.error("Incorrect password")
+
+    st.markdown('</div>', unsafe_allow_html=True)
     return False
 
 # ---------------- UI ----------------
