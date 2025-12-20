@@ -79,23 +79,35 @@ def init_db():
 # -------- LOGIN --------
 def login():
     st.title("🔐 Login")
-    u = st.text_input("Username")
-    p = st.text_input("Password", type="password")
+
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
 
     if st.button("Login"):
-        r = db().execute(
-            "SELECT id, password, role FROM users WHERE username=?",
-            (u,)
+        conn = db()
+        cur = conn.cursor()
+
+        user = cur.execute(
+            "SELECT id, username, password, role FROM users WHERE username=?",
+            (username.strip(),)
         ).fetchone()
 
-        if r and hash_pw(p) == r[1]:
-            st.session_state.user = {"id": r[0], "role": r[2]}
+        if user is None:
+            st.error("User does not exist")
+            return
+
+        user_id, db_username, db_password, role = user
+
+        if hash_pw(password) == db_password:
+            st.session_state.user = {
+                "id": user_id,
+                "username": db_username,
+                "role": role
+            }
+            st.success("Login successful")
             st.rerun()
         else:
-            st.error("Invalid login")
-
-def is_admin():
-    return st.session_state.user["role"] == "admin"
+            st.error("Invalid password")
 
 # -------- EXPORT HELPERS --------
 def export_excel(df, name):
