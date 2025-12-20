@@ -1,10 +1,10 @@
 import streamlit as st
 import sqlite3, hashlib
 import pandas as pd
-from datetime import date, datetime
+from datetime import datetime, date
 from io import BytesIO
 
-# -------- SAFE OPTIONAL IMPORTS --------
+# ---------- OPTIONAL LIBRARIES ----------
 try:
     import matplotlib.pyplot as plt
     MATPLOTLIB = True
@@ -19,12 +19,12 @@ try:
 except:
     PDF_OK = False
 
-# -------- CONFIG --------
-DB = "erp_full_app.db"
+# ---------- CONFIG ----------
+DB = "erp_complete.db"
 SALT = "secure2025"
-st.set_page_config("ERP Application", "🏢", layout="wide")
+st.set_page_config("ERP System", "🏢", layout="wide")
 
-# -------- DATABASE --------
+# ---------- DATABASE ----------
 def db():
     conn = sqlite3.connect(DB, check_same_thread=False)
     conn.execute("PRAGMA foreign_keys = ON")
@@ -33,18 +33,19 @@ def db():
 def hash_pw(pw):
     return hashlib.sha256((SALT + pw).encode()).hexdigest()
 
+# ---------- INIT DB ----------
 def init_db():
     c = db().cursor()
 
     c.execute("""CREATE TABLE IF NOT EXISTS users(
-        id INTEGER PRIMARY KEY,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT UNIQUE,
         password TEXT,
         role TEXT
     )""")
 
     c.execute("""CREATE TABLE IF NOT EXISTS customers(
-        id INTEGER PRIMARY KEY,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT,
         mobile TEXT UNIQUE,
         email TEXT,
@@ -52,64 +53,37 @@ def init_db():
     )""")
 
     c.execute("""CREATE TABLE IF NOT EXISTS products(
-        id INTEGER PRIMARY KEY,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT,
         price REAL,
         stock REAL
     )""")
 
     c.execute("""CREATE TABLE IF NOT EXISTS invoices(
-        id INTEGER PRIMARY KEY,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
         invoice_no TEXT,
         date TEXT,
         customer TEXT,
-        total REAL
+        total REAL,
+        paid REAL DEFAULT 0
     )""")
 
     # default users
-    if not c.execute("SELECT 1 FROM users WHERE username='admin'").fetchone():
-        c.execute("INSERT INTO users VALUES(NULL,'admin',?, 'admin')",
-                  (hash_pw("admin123"),))
-    if not c.execute("SELECT 1 FROM users WHERE username='staff'").fetchone():
-        c.execute("INSERT INTO users VALUES(NULL,'staff',?, 'staff')",
-                  (hash_pw("staff123"),))
+    c.execute(
+        "INSERT OR IGNORE INTO users (username,password,role) VALUES (?,?,?)",
+        ("admin", hash_pw("admin123"), "admin")
+    )
+    c.execute(
+        "INSERT OR IGNORE INTO users (username,password,role) VALUES (?,?,?)",
+        ("staff", hash_pw("staff123"), "staff")
+    )
 
     db().commit()
 
-# -------- LOGIN --------
-def login():
-    st.title("🔐 Login")
+# ---------- HELPERS ----------
+def is_admin():
+    return "user" in st.session_state and st.session_state.user["role"] == "admin"
 
-    username = st.text_input("Username")
-    password = st.text_input("Password", type="password")
-
-    if st.button("Login"):
-        conn = db()
-        cur = conn.cursor()
-
-        user = cur.execute(
-            "SELECT id, username, password, role FROM users WHERE username=?",
-            (username.strip(),)
-        ).fetchone()
-
-        if user is None:
-            st.error("User does not exist")
-            return
-
-        user_id, db_username, db_password, role = user
-
-        if hash_pw(password) == db_password:
-            st.session_state.user = {
-                "id": user_id,
-                "username": db_username,
-                "role": role
-            }
-            st.success("Login successful")
-            st.rerun()
-        else:
-            st.error("Invalid password")
-
-# -------- EXPORT HELPERS --------
 def export_excel(df, name):
     buf = BytesIO()
     df.to_excel(buf, index=False)
@@ -132,21 +106,45 @@ def export_pdf(df, name):
     buf.seek(0)
     st.download_button("⬇ PDF", buf, name, "application/pdf")
 
-# -------- DASHBOARD --------
+# ---------- LOGIN ----------
+def login():
+    st.title("🔐 Login")
+    u = st.text_input("Username")
+    p = st.text_input("Password", type="password")
+
+    if st.button("Login"):
+        user = db().execute(
+            "SELECT id,password,role FROM users WHERE username=?",
+            (u.strip(),)
+        ).fetchone()
+
+        if not user:
+            st.error("User does not exist")
+            return
+
+        if hash_pw(p) != user[1]:
+            st.error("Invalid password")
+            return
+
+        st.session_state.user = {"id": user[0], "role": user[2]}
+        st.success("Login successful")
+        st.rerun()
+
+# ---------- DASHBOARD ----------
 def dashboard():
     st.header("📊 Dashboard")
     d = db()
 
     f1, f2 = st.columns(2)
-    from_d = f1.date_input("From Date", date.today().replace(day=1))
-    to_d = f2.date_input("To Date", date.today())
+    fd = f1.date_input("From", date.today().replace(day=1))
+    td = f2.date_input("To", date.today())
 
     df = pd.read_sql("""
-        SELECT DATE(date) as day, SUM(total) as sales
+        SELECT DATE(date) day, SUM(total) sales
         FROM invoices
         WHERE DATE(date) BETWEEN ? AND ?
         GROUP BY DATE(date)
-    """, d, params=(from_d, to_d))
+    """, d, params=(fd, td))
 
     st.metric("Total Sales", f"₹ {df.sales.sum() if not df.empty else 0:,.2f}")
 
@@ -161,7 +159,7 @@ def dashboard():
         export_excel(df, "dashboard_sales.xlsx")
         export_pdf(df, "dashboard_sales.pdf")
 
-# -------- CUSTOMERS --------
+# ---------- CUSTOMERS ----------
 def customers_page():
     st.header("👥 Customers")
     with st.form("cust"):
@@ -179,15 +177,16 @@ def customers_page():
                 st.success("Customer added")
             except:
                 st.error("Mobile already exists")
+
     st.dataframe(pd.read_sql("SELECT * FROM customers", db()))
 
-# -------- PRODUCTS --------
+# ---------- PRODUCTS ----------
 def products_page():
     st.header("📦 Products")
     with st.form("prod"):
         n = st.text_input("Product Name")
         p = st.number_input("Price", 0.0)
-        s = st.number_input("Stock", 0.0)
+        s = st.number_input("Opening Stock", 0.0)
         if st.form_submit_button("Add"):
             db().execute(
                 "INSERT INTO products(name,price,stock) VALUES(?,?,?)",
@@ -195,33 +194,44 @@ def products_page():
             )
             db().commit()
             st.success("Product added")
+
     st.dataframe(pd.read_sql("SELECT * FROM products", db()))
 
-# -------- SALES --------
+# ---------- SALES ----------
 def sales_page():
     st.header("🧾 Sales / Invoice")
     prods = pd.read_sql("SELECT * FROM products", db())
     if prods.empty:
         st.info("Add products first")
         return
+
     p = st.selectbox("Product", prods.name)
     q = st.number_input("Quantity", 1.0)
+
     if st.button("Create Invoice"):
-        price = prods[prods.name==p].price.iloc[0]
-        total = price*q
+        row = prods[prods.name==p].iloc[0]
+        if q > row.stock:
+            st.error("Not enough stock")
+            return
+
+        total = row.price * q
         inv = f"INV-{int(datetime.now().timestamp())}"
+
         db().execute(
             "INSERT INTO invoices(invoice_no,date,customer,total) VALUES(?,?,?,?)",
             (inv, datetime.now().isoformat(), "Walk-in", total)
         )
         db().execute(
-            "UPDATE products SET stock=stock-? WHERE name=?",
-            (q,p)
+            "UPDATE products SET stock=stock-? WHERE id=?",
+            (q, row.id)
         )
         db().commit()
         st.success(f"Invoice {inv} created")
 
-# -------- REPORTS --------
+    st.subheader("Invoice History")
+    st.dataframe(pd.read_sql("SELECT * FROM invoices", db()))
+
+# ---------- REPORTS ----------
 def reports_page():
     st.header("📑 Reports")
     df = pd.read_sql("SELECT * FROM invoices", db())
@@ -230,7 +240,7 @@ def reports_page():
         export_excel(df, "sales_report.xlsx")
         export_pdf(df, "sales_report.pdf")
 
-# -------- MAIN --------
+# ---------- MAIN ----------
 def main():
     init_db()
 
@@ -241,14 +251,15 @@ def main():
     st.sidebar.success(f"Logged in as {st.session_state.user['role'].upper()}")
 
     if is_admin():
-        menu = st.sidebar.radio("Menu", [
-            "Dashboard","Customers","Products",
-            "Sales / Invoices","Reports","Logout"
-        ])
+        menu = st.sidebar.radio(
+            "Menu",
+            ["Dashboard","Customers","Products","Sales","Reports","Logout"]
+        )
     else:
-        menu = st.sidebar.radio("Menu", [
-            "Dashboard","Customers","Sales / Invoices","Logout"
-        ])
+        menu = st.sidebar.radio(
+            "Menu",
+            ["Dashboard","Customers","Sales","Logout"]
+        )
 
     if menu == "Dashboard":
         dashboard()
@@ -256,7 +267,7 @@ def main():
         customers_page()
     elif menu == "Products":
         products_page()
-    elif menu == "Sales / Invoices":
+    elif menu == "Sales":
         sales_page()
     elif menu == "Reports":
         reports_page()
